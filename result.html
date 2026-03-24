@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>分析結果 | 競馬物差しツール</title>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #f7f6f2; margin: 0; padding: 20px; display: flex; justify-content: center; color: #333; }
+        .container { background-color: #ffffff; border-radius: 12px; padding: 30px 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); width: 100%; max-width: 500px; }
+        h2.main-title { color: #4a4a4a; font-size: 20px; border-bottom: 2px solid #7b8d7a; padding-bottom: 10px; margin-top: 0; text-align: center; }
+
+        /* タブ */
+        .tab-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
+        .tab-btn {
+            padding: 8px 14px; border: 2px solid #ddd; border-radius: 8px;
+            background: #fafafa; cursor: pointer; font-size: 13px; font-weight: bold;
+            color: #777; transition: all 0.2s; position: relative;
+        }
+        .tab-btn.active { border-color: #7b8d7a; background: #7b8d7a; color: #fff; }
+        .tab-btn.loaded { border-color: #7b8d7a; color: #4a4a4a; }
+        .tab-btn.error { border-color: #e74c3c; color: #e74c3c; }
+        .tab-btn .spinner {
+            display: inline-block; width: 12px; height: 12px; border: 2px solid #ccc;
+            border-top-color: #7b8d7a; border-radius: 50%; animation: spin 0.8s linear infinite;
+            margin-left: 6px; vertical-align: middle;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* タブコンテンツ */
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* 既存の結果スタイル */
+        .section-title { background-color: #7b8d7a; color: white; padding: 10px 15px; border-radius: 6px; font-size: 16px; margin-top: 30px; margin-bottom: 20px; }
+        .horse-rank { margin-bottom: 25px; padding-bottom: 15px; border-bottom: 1px dashed #ccc; }
+        .rank-title { font-size: 18px; margin: 0 0 10px 0; color: #2c3e50; }
+        .time-diff { color: #e74c3c; font-weight: bold; }
+        .theory-box { background-color: #f8f9fa; border-left: 4px solid #7b8d7a; padding: 12px 15px; border-radius: 0 6px 6px 0; font-size: 14px; }
+        .theory-text { margin: 0 0 8px 0; color: #444; }
+        .theory-details { margin: 0; padding-left: 20px; color: #555; }
+        .theory-details li { margin-bottom: 6px; line-height: 1.4; }
+        .race-link { color: #3498db; text-decoration: none; font-weight: bold; border-bottom: 1px solid transparent; transition: 0.2s; }
+        .race-link:hover { color: #2980b9; border-bottom: 1px solid #2980b9; }
+        .unranked-box { background-color: #fdf2e9; border: 1px solid #f5c6cb; padding: 15px; border-radius: 8px; margin-top: 20px; }
+        .unranked-box h4 { margin: 0 0 10px 0; color: #d35400; font-size: 15px; }
+        .unranked-box p { margin: 0; font-size: 14px; color: #666; }
+
+        .back-btn { display: block; text-align: center; margin-top: 30px; background-color: #ddd; color: #333; padding: 14px 20px; text-decoration: none; border-radius: 8px; font-weight: bold; }
+
+        .download-btn {
+            display: none; text-align: center; margin-top: 12px;
+            background: linear-gradient(135deg, #7b8d7a, #5a6e59); color: #fff;
+            padding: 14px 20px; border: none; border-radius: 8px;
+            font-weight: bold; font-size: 15px; cursor: pointer; width: 100%;
+            transition: opacity 0.2s;
+        }
+        .download-btn:hover { opacity: 0.85; }
+
+        .loading-msg { text-align: center; color: #999; padding: 40px 0; font-size: 14px; }
+        .error-msg { text-align: center; color: #e74c3c; padding: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2 class="main-title">📊 物差し比較結果</h2>
+
+        {% if race_list|length > 1 %}
+        <div class="tab-bar" id="tabBar">
+            {% for race in race_list %}
+            <div class="tab-btn" data-race-id="{{ race.race_id }}" data-index="{{ loop.index0 }}" onclick="switchTab({{ loop.index0 }})">
+                {{ race.race_num }}R<span class="spinner"></span>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <div id="tabContents">
+            {% for race in race_list %}
+            <div class="tab-content" id="content-{{ loop.index0 }}">
+                <div class="loading-msg">{{ race.race_num }}R を分析中...</div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <button class="download-btn" id="downloadBtn" onclick="downloadHTML()">📥 この結果をHTMLファイルでダウンロード</button>
+        <a href="/" class="back-btn">別のレースを比較する</a>
+    </div>
+
+    <script>
+        const raceList = {{ race_list | tojson }};
+        const waterMode = {{ (water_mode or '') | tojson }};
+        let completedCount = 0;
+
+        function switchTab(index) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`.tab-btn[data-index="${index}"]`).classList.add('active');
+            document.getElementById(`content-${index}`).classList.add('active');
+        }
+
+        function checkAllDone() {
+            completedCount++;
+            if (completedCount >= raceList.length) {
+                document.getElementById('downloadBtn').style.display = 'block';
+            }
+        }
+
+        async function fetchRace(index) {
+            const race = raceList[index];
+            const btn = document.querySelector(`.tab-btn[data-index="${index}"]`);
+            const content = document.getElementById(`content-${index}`);
+
+            try {
+                const res = await fetch('/analyze_single', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ race_id: race.race_id, water_mode: waterMode })
+                });
+                const data = await res.json();
+
+                if (res.ok) {
+                    content.innerHTML = `<div class="race-title" style="font-size:16px; color:#7b8d7a; font-weight:bold; margin-bottom:20px; text-align:center;">${data.title}</div><div class="result-box">${data.html}</div>`;
+                    if (btn) {
+                        btn.classList.add('loaded');
+                        btn.querySelector('.spinner')?.remove();
+                    }
+                } else {
+                    throw new Error(data.error || 'エラー');
+                }
+            } catch (e) {
+                content.innerHTML = `<div class="error-msg">${race.race_num}R の取得に失敗: ${e.message}</div>`;
+                if (btn) {
+                    btn.classList.add('error');
+                    btn.querySelector('.spinner')?.remove();
+                }
+            } finally {
+                checkAllDone();
+            }
+        }
+
+        function downloadHTML() {
+            const styles = document.querySelector('style').outerHTML;
+            const now = new Date();
+            const dateStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}_${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+
+            // タブボタンHTML（スピナーなし・ラベルはレース番号）
+            let tabBarHTML = '';
+            let tabContentsHTML = '';
+
+            for (let i = 0; i < raceList.length; i++) {
+                const race = raceList[i];
+                const content = document.getElementById(`content-${i}`);
+                const contentHTML = content ? content.innerHTML : '';
+                const isActive = i === 0 ? ' active' : '';
+                // タブボタンのラベルをレースタイトルから取得（race-titleが入っていれば）
+                const titleEl = content ? content.querySelector('.race-title') : null;
+                const label = titleEl ? titleEl.textContent.trim().split('\n')[0].trim() : `${race.race_num}R`;
+                const shortLabel = `${race.race_num}R`;
+
+                tabBarHTML += `<div class="tab-btn${isActive}" data-index="${i}" onclick="switchTab(${i})">${shortLabel}</div>`;
+                tabContentsHTML += `<div class="tab-content${isActive}" id="dl-content-${i}">${contentHTML}</div>`;
+            }
+
+            const hasMultiple = raceList.length > 1;
+
+            const fullHTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>競馬物差し分析結果 ${dateStr}</title>
+    ${styles}
+</head>
+<body>
+    <div class="container">
+        <h2 class="main-title">📊 物差し比較結果</h2>
+        ${hasMultiple ? `<div class="tab-bar">${tabBarHTML}</div>` : ''}
+        <div>${tabContentsHTML}</div>
+        <p style="text-align:center; color:#aaa; font-size:12px; margin-top:30px;">Generated by 競馬物差しツール — ${now.toLocaleString('ja-JP')}</p>
+    </div>
+    <script>
+        function switchTab(index) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector('.tab-btn[data-index="' + index + '"]').classList.add('active');
+            document.getElementById('dl-content-' + index).classList.add('active');
+        }
+    <\/script>
+</body>
+</html>`;
+
+            const blob = new Blob([fullHTML], { type: 'text/html; charset=utf-8' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `horse_ruler_${dateStr}.html`;
+            a.click();
+            URL.revokeObjectURL(a.href);
+        }
+
+        // 初期化
+        if (raceList.length === 1) {
+            document.getElementById('content-0').classList.add('active');
+            fetchRace(0);
+        } else {
+            switchTab(0);
+            raceList.forEach((_, i) => fetchRace(i));
+        }
+    </script>
+</body>
+</html>

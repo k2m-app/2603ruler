@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>競馬物差しツール</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background-color: #f7f6f2;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            background-color: #ffffff;
+            border-radius: 12px;
+            padding: 30px 20px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+            margin-top: 20px;
+        }
+        h1 { font-size: 22px; color: #4a4a4a; margin-bottom: 10px; }
+        p { font-size: 14px; color: #777; margin-bottom: 25px; }
+        input[type="text"] {
+            width: 100%; padding: 14px; margin-bottom: 20px;
+            border: 1px solid #ddd; border-radius: 8px;
+            box-sizing: border-box; font-size: 16px; background-color: #fafafa;
+        }
+        button {
+            background-color: #7b8d7a; color: white; border: none;
+            padding: 16px 20px; border-radius: 8px; font-size: 16px;
+            font-weight: bold; width: 100%; cursor: pointer; transition: background-color 0.3s;
+        }
+        button:hover { background-color: #5c6b5b; }
+
+        /* モード選択 */
+        .mode-selector {
+            display: flex; gap: 0; margin-bottom: 20px; border-radius: 8px; overflow: hidden;
+            border: 2px solid #7b8d7a;
+        }
+        .mode-selector label {
+            flex: 1; padding: 12px 8px; font-size: 14px; font-weight: bold;
+            text-align: center; cursor: pointer; transition: all 0.2s;
+            background: #fff; color: #666;
+        }
+        .mode-selector input[type="radio"] { display: none; }
+        .mode-selector input[type="radio"]:checked + label {
+            background: #7b8d7a; color: #fff;
+        }
+
+        /* 水分量セクション */
+        .water-section {
+            display: none; margin-bottom: 20px; padding: 15px;
+            background: #eef6ff; border-radius: 8px; border: 1px solid #b3d4f7;
+        }
+        .water-section.visible { display: block; }
+        .water-section h3 {
+            font-size: 14px; color: #2c3e50; margin: 0 0 12px 0;
+        }
+        .water-options { display: flex; gap: 8px; }
+        .water-options label {
+            flex: 1; display: block; padding: 10px 8px; font-size: 13px;
+            text-align: center; cursor: pointer; border-radius: 6px;
+            border: 2px solid #b3d4f7; background: #fff; color: #555;
+            font-weight: bold; transition: all 0.2s;
+        }
+        .water-options input[type="radio"] { display: none; }
+        .water-options input[type="radio"]:checked + label {
+            background: #3498db; color: #fff; border-color: #3498db;
+        }
+
+        .race-checkboxes {
+            display: grid; grid-template-columns: repeat(4, 1fr);
+            gap: 8px; margin-bottom: 20px; text-align: left;
+        }
+        .race-checkboxes label {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 14px; color: #555; cursor: pointer;
+            padding: 6px 8px; border-radius: 6px; transition: background-color 0.2s;
+        }
+        .race-checkboxes label:hover { background-color: #f0efe9; }
+        .race-checkboxes input[type="checkbox"] { accent-color: #7b8d7a; width: 16px; height: 16px; }
+        .checkbox-header { font-size: 13px; color: #999; margin-bottom: 8px; text-align: left; }
+        .select-actions { display: flex; gap: 10px; margin-bottom: 10px; }
+        .select-actions span {
+            font-size: 12px; color: #7b8d7a; cursor: pointer; text-decoration: underline;
+        }
+        .select-actions span:hover { color: #5c6b5b; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐎 競馬物差しツール</h1>
+        <p>netkeibaのURLを入力してください</p>
+        <form action="/analyze" method="POST">
+
+            <!-- モード選択 -->
+            <div class="mode-selector">
+                <input type="radio" name="race_mode" id="mode_normal" value="normal" checked onchange="toggleWater()">
+                <label for="mode_normal">JRA＆地方競馬</label>
+                <input type="radio" name="race_mode" id="mode_banei" value="banei" onchange="toggleWater()">
+                <label for="mode_banei">🐴 ばんえい競馬</label>
+            </div>
+
+            <!-- ばんえい用: 水分量 -->
+            <div class="water-section" id="waterSection">
+                <h3>💧 馬場の水分量を選択</h3>
+                <div class="water-options">
+                    <input type="radio" name="water_mode" id="water_none" value="" checked>
+                    <label for="water_none">指定なし</label>
+                    <input type="radio" name="water_mode" id="water_dry" value="dry">
+                    <label for="water_dry">1.9%以下<br><span style="font-size:11px;font-weight:normal;">（軽馬場）</span></label>
+                    <input type="radio" name="water_mode" id="water_wet" value="wet">
+                    <label for="water_wet">2.0%以上<br><span style="font-size:11px;font-weight:normal;">（重馬場）</span></label>
+                </div>
+            </div>
+
+            <input type="text" name="url" placeholder="https://race.netkeiba.com/race/..." required>
+
+            <p class="checkbox-header">他のレースも同時に分析（任意）</p>
+            <div class="select-actions">
+                <span onclick="document.querySelectorAll('.race-checkboxes input').forEach(c=>c.checked=true)">全選択</span>
+                <span onclick="document.querySelectorAll('.race-checkboxes input').forEach(c=>c.checked=false)">全解除</span>
+            </div>
+            <div class="race-checkboxes">
+                <label><input type="checkbox" name="races" value="1">1R</label>
+                <label><input type="checkbox" name="races" value="2">2R</label>
+                <label><input type="checkbox" name="races" value="3">3R</label>
+                <label><input type="checkbox" name="races" value="4">4R</label>
+                <label><input type="checkbox" name="races" value="5">5R</label>
+                <label><input type="checkbox" name="races" value="6">6R</label>
+                <label><input type="checkbox" name="races" value="7">7R</label>
+                <label><input type="checkbox" name="races" value="8">8R</label>
+                <label><input type="checkbox" name="races" value="9">9R</label>
+                <label><input type="checkbox" name="races" value="10">10R</label>
+                <label><input type="checkbox" name="races" value="11">11R</label>
+                <label><input type="checkbox" name="races" value="12">12R</label>
+            </div>
+            <button type="submit">比較スタート</button>
+        </form>
+    </div>
+
+    <script>
+        function toggleWater() {
+            const isBanei = document.getElementById('mode_banei').checked;
+            document.getElementById('waterSection').classList.toggle('visible', isBanei);
+            // ばんえい以外なら水分量リセット
+            if (!isBanei) {
+                document.getElementById('water_none').checked = true;
+            }
+        }
+    </script>
+</body>
+</html>
