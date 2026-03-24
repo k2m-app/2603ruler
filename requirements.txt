@@ -1,0 +1,5 @@
+streamlit
+flask
+requests
+beautifulsoup4
+networkx
