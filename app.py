@@ -404,12 +404,19 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
             else:
                 base_cost = 20 if race['course'] == target_course else 30
         else:
-            base_cost = 10
-            if race['course'] == target_course:
-                if race['distance'] == target_distance:
-                    base_cost = 1
-                else:
-                    base_cost = 5
+            # JRA: NAR同様に距離差で細分化（同距離同競馬場を最重視）
+            try:
+                dist_diff = abs(int(race['distance']) - int(target_distance))
+            except (ValueError, TypeError):
+                dist_diff = 9999
+            if dist_diff == 0:
+                base_cost = 1 if race['course'] == target_course else 2
+            elif dist_diff <= 100:
+                base_cost = 5 if race['course'] == target_course else 8
+            elif dist_diff <= 200:
+                base_cost = 10 if race['course'] == target_course else 15
+            else:
+                base_cost = 20 if race['course'] == target_course else 30
 
         cap_val = 30.0 if is_banei else 10.0
 
@@ -543,16 +550,17 @@ def format_horse_name(horse, umaban_dict, race_id=None):
         return f"[隠] {horse}"
 
 def get_rank_tier(diff, is_banei=False):
+    """絶対diff閾値によるランク判定（ストイック版）"""
     r_diff = round(diff, 1)
     if is_banei:
-        if r_diff <= 7.0: return "S"
-        elif r_diff <= 13.0: return "A"
-        elif r_diff <= 20.0: return "B"
+        if r_diff <= 5.0: return "S"
+        elif r_diff <= 10.0: return "A"
+        elif r_diff <= 18.0: return "B"
         else: return "C"
     else:
-        if r_diff <= 0.4: return "S"
-        elif r_diff < 0.9: return "A"
-        elif r_diff <= 1.4: return "B"
+        if r_diff <= 0.3: return "S"
+        elif r_diff <= 0.7: return "A"
+        elif r_diff <= 1.2: return "B"
         else: return "C"
 
 def assign_tiers_by_comparison(ranked_list, is_banei=False):
@@ -589,14 +597,43 @@ def assign_tiers_by_comparison(ranked_list, is_banei=False):
     return result
 
 # 【追加】複数ルート（クロスチェック）を加味してタイムを平均化する処理
-def calc_path_score(G, path):
+def calc_path_score(G, path, target_course=None, target_distance=None):
+    """パス上のタイム差を合算。同距離同競馬場のデータは重み2倍で反映。"""
     score = 0.0
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
         if G.has_edge(u, v):
-            score -= G[u][v]['rank_diff']
+            edge = G[u][v]
+            # 同距離同競馬場データの重み付け
+            if target_course and target_distance and 'history' in edge:
+                same_diffs = [h['diff'] for h in edge['history']
+                              if h['course'] == target_course and h['distance'] == target_distance]
+                other_diffs = [h['diff'] for h in edge['history']
+                               if h['course'] != target_course or h['distance'] != target_distance]
+                if same_diffs:
+                    # 同条件diffを2倍重みで平均
+                    all_weighted = same_diffs * 2 + other_diffs
+                    weighted_avg = sum(all_weighted) / len(all_weighted)
+                    score -= weighted_avg
+                else:
+                    score -= edge['rank_diff']
+            else:
+                score -= edge['rank_diff']
         else:
-            score += G[v][u]['rank_diff']
+            edge = G[v][u]
+            if target_course and target_distance and 'history' in edge:
+                same_diffs = [h['diff'] for h in edge['history']
+                              if h['course'] == target_course and h['distance'] == target_distance]
+                other_diffs = [h['diff'] for h in edge['history']
+                               if h['course'] != target_course or h['distance'] != target_distance]
+                if same_diffs:
+                    all_weighted = same_diffs * 2 + other_diffs
+                    weighted_avg = sum(all_weighted) / len(all_weighted)
+                    score += weighted_avg
+                else:
+                    score += edge['rank_diff']
+            else:
+                score += edge['rank_diff']
     return score
 
 # 【追加】複数ルートでの表現を可能にするUIビルダ
@@ -614,14 +651,14 @@ def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, i
         
         gap = abs(avg_score)
         if is_banei:
-            if gap <= 5.0: sep = " ＝ "
-            elif gap <= 10.0: sep = " ＞ "
-            elif gap <= 20.0: sep = " ＞＞ "
+            if gap <= 3.0: sep = " ＝ "
+            elif gap <= 7.0: sep = " ＞ "
+            elif gap <= 13.0: sep = " ＞＞ "
             else: sep = " ＞＞＞ "
         else:
-            if gap <= 0.3: sep = " ＝ "
-            elif gap <= 0.7: sep = " ＞ "
-            elif gap <= 1.2: sep = " ＞＞ "
+            if gap <= 0.2: sep = " ＝ "
+            elif gap <= 0.5: sep = " ＞ "
+            elif gap <= 0.9: sep = " ＞＞ "
             else: sep = " ＞＞＞ "
         
         if k == 0:
@@ -662,10 +699,10 @@ def render_path_details(G, runner_path, runner_G, umaban_dict, target_course, ta
     return details
 
 def _render_single_path_details(G, path, umaban_dict, target_course, target_distance, race_id=None, is_banei=False, indent=False):
-    close_th = 5.0 if is_banei else 0.3
-    near_th = 10.0 if is_banei else 0.7
-    far_th = 20.0 if is_banei else 1.2
-    draw_th = 3.0 if is_banei else 0.1
+    close_th = 3.0 if is_banei else 0.2
+    near_th = 7.0 if is_banei else 0.5
+    far_th = 13.0 if is_banei else 0.9
+    draw_th = 2.0 if is_banei else 0.1
 
     details = []
     li_style = " style='margin-left: 15px; font-size: 0.9em; color: #555; list-style-type: circle;'" if indent else ""
@@ -720,6 +757,8 @@ def _render_single_path_details(G, path, umaban_dict, target_course, target_dist
             match_badge = " <span style='color:#e67e22;font-weight:bold;'>[場同]</span>"
         elif is_same_dist:
             match_badge = " <span style='color:#27ae60;font-weight:bold;'>[距同]</span>"
+        else:
+            match_badge = " <span style='color:#95a5a6;font-size:0.85em;'>[別条件]</span>"
 
         match_badge += star_mark
 
@@ -812,8 +851,8 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                     hop_scores = []
                     for p in edge_paths:
                         p_oriented = p if p[0] == hop_u else p[::-1]
-                        hop_scores.append(calc_path_score(G, p_oriented))
-                    # 複数ルートのスコアを平均化する！
+                        hop_scores.append(calc_path_score(G, p_oriented, target_course, target_distance))
+                    # 複数ルートのスコアを平均化する！（同距離同競馬場データは重み2倍で反映済み）
                     total_score += sum(hop_scores) / len(hop_scores)
                 pair_scores[u][v] = total_score
             except nx.NetworkXNoPath:
@@ -847,7 +886,82 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                     final_scores[h] -= min_score
 
     ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
-    tier_map = assign_tiers_by_comparison(ranked_list, is_banei=is_banei)
+
+    # === ストイック合議制ティア判定 ===
+    # 方式A: 絶対diff閾値によるランク判定
+    abs_tiers = {}
+    for h, s in ranked_list:
+        abs_tiers[h] = get_rank_tier(max(0.0, s), is_banei=is_banei)
+
+    # 方式B: ギャップベースのティア割り当て
+    gap_tiers = assign_tiers_by_comparison(ranked_list, is_banei=is_banei)
+
+    # 方式C: ペアワイズ勝敗判定（ストイック閾値）
+    beat_th = 5.0 if is_banei else 0.3
+    beats_set = {h: set() for h in current_runners}
+    for u in current_runners:
+        for v in current_runners:
+            if u == v:
+                continue
+            s_uv = pair_scores[u].get(v, float('inf'))
+            s_vu = pair_scores[v].get(u, float('inf'))
+            if s_uv != float('inf') and s_vu != float('inf'):
+                if s_uv < -beat_th:  # u は v より速い
+                    beats_set[u].add(v)
+
+    beaten_by = {h: set() for h in current_runners}
+    for u in current_runners:
+        for v in beats_set[u]:
+            beaten_by[v].add(u)
+
+    pw_tiers = {}
+    remaining = set(current_runners)
+    s_h = {h for h in remaining if not beaten_by[h].intersection(remaining)}
+    for h in s_h:
+        pw_tiers[h] = "S"
+    remaining -= s_h
+    a_h = {h for h in remaining if beaten_by[h].intersection(remaining).issubset(s_h)}
+    for h in a_h:
+        pw_tiers[h] = "A"
+    remaining -= a_h
+    b_h = {h for h in remaining if beaten_by[h].intersection(remaining | s_h | a_h).issubset(s_h | a_h)}
+    for h in b_h:
+        pw_tiers[h] = "B"
+    remaining -= b_h
+    for h in remaining:
+        pw_tiers[h] = "C"
+
+    # 3方式の最も厳しいランクを採用
+    _tier_rank = {"S": 0, "A": 1, "B": 2, "C": 3}
+    _rank_tier = {0: "S", 1: "A", 2: "B", 3: "C"}
+    tier_map = {}
+    for h, _ in ranked_list:
+        t_abs = _tier_rank.get(abs_tiers.get(h, "C"), 3)
+        t_gap = _tier_rank.get(gap_tiers.get(h, "C"), 3)
+        t_pw  = _tier_rank.get(pw_tiers.get(h, "C"), 3)
+        tier_map[h] = _rank_tier[max(t_abs, t_gap, t_pw)]
+
+    # 同距離同競馬場で直接勝っている馬が下位ランクにならないよう補正
+    for u in current_runners:
+        for v in current_runners:
+            if u == v:
+                continue
+            if G.has_edge(u, v) or G.has_edge(v, u):
+                a, b = (u, v) if u < v else (v, u)
+                if G.has_edge(a, b):
+                    edge = G[a][b]
+                    same_cond_diffs = [h['raw_diff'] for h in edge['history']
+                                       if h['course'] == target_course and h['distance'] == target_distance]
+                    if same_cond_diffs:
+                        avg_sc = sum(same_cond_diffs) / len(same_cond_diffs)
+                        # avg_sc < 0 means a is faster, > 0 means b is faster
+                        winner, loser = (a, b) if avg_sc < 0 else (b, a)
+                        th = 5.0 if is_banei else 0.5
+                        if abs(avg_sc) >= th:
+                            w_t = _tier_rank.get(tier_map.get(winner, "C"), 3)
+                            l_t = _tier_rank.get(tier_map.get(loser, "C"), 3)
+                            if w_t > l_t:
+                                tier_map[winner] = tier_map[loser]
 
     return fastest, final_scores, ranked_list, tier_map
 
