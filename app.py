@@ -518,29 +518,40 @@ def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, i
         
         hop_scores = [calc_path_score(G, p if p[0] == u else p[::-1]) for p in edge_paths]
         avg_score = sum(hop_scores) / len(hop_scores) if hop_scores else 0.0
-        gap = abs(avg_score)
         
+        # 👑 大修正：UIの矢印の向きを「勝敗」に正しく連動させる
         if is_banei:
-            if gap <= 3.0: sep = " ＝ "
-            elif gap <= 7.0: sep = " ＞ "
-            elif gap <= 13.0: sep = " ＞＞ "
-            else: sep = " ＞＞＞ "
+            if abs(avg_score) <= 3.0: sep = " ＝ "
+            elif avg_score < 0: # uの方が速い
+                if avg_score >= -7.0: sep = " ＞ "
+                elif avg_score >= -13.0: sep = " ＞＞ "
+                else: sep = " ＞＞＞ "
+            else: # uの方が遅い
+                if avg_score <= 7.0: sep = " ＜ "
+                elif avg_score <= 13.0: sep = " ＜＜ "
+                else: sep = " ＜＜＜ "
         else:
-            if gap <= 0.2: sep = " ＝ "
-            elif gap <= 0.5: sep = " ＞ "
-            elif gap <= 0.9: sep = " ＞＞ "
-            else: sep = " ＞＞＞ "
+            if abs(avg_score) <= 0.2: sep = " ＝ "
+            elif avg_score < 0: # uの方が速い
+                if avg_score >= -0.5: sep = " ＞ "
+                elif avg_score >= -0.9: sep = " ＞＞ "
+                else: sep = " ＞＞＞ "
+            else: # uの方が遅い
+                if avg_score <= 0.5: sep = " ＜ "
+                elif avg_score <= 0.9: sep = " ＜＜ "
+                else: sep = " ＜＜＜ "
         
         if k == 0: parts.append(format_horse_name(u, umaban_dict, race_id))
         discount_badge = "<span style='color:#9b59b6; font-size:0.8em; font-weight:bold;'>[隠れ馬割引適用]</span> " if is_hidden_comparison and k == len(runner_path) - 2 else ""
         
         if len(edge_paths) > 1:
-            parts.append(f"{sep}<span style='color:#e67e22; font-size:0.85em;'>[複数ルート加味]</span>{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
+            parts.append(f"{sep}<span style='color:#e67e22; font-size:0.85em;'>[複数ルート]</span>{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
         else:
             p = edge_paths[0]
-            for m in (p if p[0] == u else p[::-1])[1:-1]:
-                parts.append(f"{sep}{format_horse_name(m, umaban_dict, race_id)}")
-            parts.append(f"{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
+            if len(p) > 2:
+                parts.append(f"{sep}<span style='color:#888; font-size:0.85em;'>[隠れ馬経由]</span>{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
+            else:
+                parts.append(f"{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
     return "".join(parts)
 
 def render_path_details(G, runner_path, runner_G, umaban_dict, target_course, target_distance, race_id=None, is_banei=False):
@@ -657,8 +668,8 @@ def build_runner_graph(undirected_G, umaban_dict, is_banei=False):
 
 def _rank_component(G, runner_G, component, umaban_dict, target_course, target_distance, is_banei=False):
     current_runners = list(component)
-    # 「互角」とみなして同じランクに引き上げるタイム差の閾値（0.2秒以下なら同ランク）
-    tie_th = 3.0 if is_banei else 0.2 
+    # 明確に「負け」と判定する閾値
+    loss_th = 3.0 if is_banei else 0.2 
 
     adv_matrix = {u: {v: 0.0 for v in current_runners} for u in current_runners}
 
@@ -692,37 +703,42 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                 adv_matrix[u][v] = float('inf')
 
     # ==================================================
-    # 👑 超進化版：アンカー（絶対基準）主導の相対クラスタリング
+    # 👑 大修正：完全なる「勝ち残り（無敗馬）トーナメント」
     # ==================================================
     pool = set(current_runners)
     tier_map = {}
     
     for tier in ["S", "A", "B"]:
         if not pool: break
+        candidates = []
         
-        # プール内で一番強い（他馬へのタイム差平均が最小）馬を「その階層のアンカー」とする
-        best_anchor = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
-        
-        # アンカー自身を階層に追加
-        tier_map[best_anchor] = tier
-        pool.remove(best_anchor)
-        
-        # アンカーと互角（タイム差が tie_th 以内、またはアンカーより速い）の馬を同じ階層に引き上げる
-        tied_horses = []
+        # 現在のプール内で「誰にも負けていない（loss_th以上遅れていない）」馬をすべて探す
         for h in pool:
-            # adv_matrix[h][best_anchor] <= tie_th なら「互角」
-            if adv_matrix[h][best_anchor] != float('inf') and adv_matrix[h][best_anchor] <= tie_th:
-                tied_horses.append(h)
-                
-        for h in tied_horses:
-            tier_map[h] = tier
-            pool.remove(h)
+            has_loss = False
+            for opp in pool:
+                if h == opp: continue
+                # adv_matrix[h][opp] が正の値なら「hはoppより遅い」。それが loss_th を超えていれば「明確な負け」
+                if adv_matrix[h][opp] != float('inf') and adv_matrix[h][opp] > loss_th:
+                    has_loss = True
+                    break
             
-    # 残った馬は全員Cランク
+            if not has_loss:
+                candidates.append(h)
+                
+        # 三すくみ等で「全員が誰かに負けている」状態になった場合のセーフティネット
+        if not candidates:
+            best_h = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
+            candidates = [best_h]
+            
+        for c in candidates:
+            tier_map[c] = tier
+            pool.remove(c)
+            
+    # S～Bにも入れなかった残りの馬はすべてCランク
     for h in pool:
         tier_map[h] = "C"
 
-    # 全体の最速馬（UI表示のベース）
+    # UI表示の基準馬（その集団のリーダー）を選ぶ。Sランクの中から一番平均成績が良い馬。
     s_tier_horses = [h for h, t in tier_map.items() if t == "S"]
     if not s_tier_horses: s_tier_horses = current_runners
     fastest = min(s_tier_horses, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
