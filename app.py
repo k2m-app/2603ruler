@@ -839,8 +839,10 @@ def analyze_single():
         is_banei = (target_track == "ばんえい")
 
         G_unified = build_unified_graph(past_races, target_course, target_track, target_distance, umaban_dict)
-        result_html_content, _, _, _, _ = analyze_all_horses_html(G_unified, past_races, umaban_dict, target_course, target_distance, is_banei=is_banei)
-
+        result_html_content, _, _, _, _ = analyze_all_horses_html(
+        G_unified, past_races, umaban_dict, target_course, target_distance, race_id=None, is_banei=is_banei
+        )
+    
         water_note = ""
         if is_banei and water_mode:
             label = "1.9%以下（軽馬場）" if water_mode == 'dry' else "2.0%以上（重馬場）"
