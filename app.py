@@ -14,6 +14,17 @@ app = Flask(__name__)
 RANK_SCORES = {"S+": 35, "S": 30, "!": 27, "A": 20, "B": 10, "C": 7}
 
 # ==========================================
+# 大井競馬場 内回り/外回り 判定関数
+# ==========================================
+def get_ooi_track(dist_str):
+    try:
+        d = int(dist_str)
+        # 大井の内回りは1500mと1600m
+        return "内" if d in [1500, 1600] else "外"
+    except:
+        return "不明"
+
+# ==========================================
 # 1. Netkeiba ディープスクレイパー
 # ==========================================
 class NetkeibaScraper:
@@ -213,6 +224,96 @@ class NetkeibaScraper:
             res = requests.get(db_url, headers=self.headers)
             res.encoding = 'EUC-JP'
             db_soup = BeautifulSoup(res.text, 'html.parser')
+
+            result_table = db_soup.find('table', class_='race_table_01')
+
+            if not result_table and is_nar_past:
+                time.sleep(0.5)
+                nar_url = f"https://nar.netkeiba.com/race/result.html?race_id={past_id}"
+                res = requests.get(nar_url, headers=self.headers)
+                res.encoding = 'EUC-JP'
+                db_soup = BeautifulSoup(res.text, 'html.parser')
+                result_table = db_soup.find('table', class_='RaceCommon_Table')
+                if not result_table:
+                    result_table = db_soup.find('table', class_='race_table_01')
+
+            if not result_table: continue
+
+            winner_sec = None
+            for tr in result_table.find_all('tr'):
+                tds = tr.find_all('td')
+                if len(tds) < 7: continue
+
+                rank_str = tds[0].text.strip()
+                if not rank_str.isdigit(): continue
+                
+                past_umaban = tds[2].text.strip()
+
+                horse_cell = tds[3]
+                horse_link = horse_cell.find('a')
+                hidden_horse_name = horse_link.text.strip() if horse_link else horse_cell.text.strip()
+
+                time_str = None
+                if len(tds) > 7:
+                    time_str = tds[7].text.strip()
+                    if not self.convert_time_to_sec(time_str):
+                        time_str = None
+                if time_str is None:
+                    for td in tds[4:]:
+                        txt = td.text.strip()
+                        if re.match(r'^\d{1,2}:\d{2}\.\d$', txt):
+                            time_str = txt
+                            break
+                if time_str is None: continue
+
+                sec = self.convert_time_to_sec(time_str)
+                if sec is None: continue
+
+                if winner_sec is None:
+                    winner_sec = sec
+
+                time_behind = round(sec - winner_sec, 1)
+                
+                if past_id in past_races_dict:
+                    past_races_dict[past_id]['horses'][hidden_horse_name] = time_behind
+                    if 'past_umaban' not in past_races_dict[past_id]:
+                        past_races_dict[past_id]['past_umaban'] = {}
+                    
+                    if not past_races_dict[past_id]['past_umaban'].get(hidden_horse_name):
+                        past_races_dict[past_id]['past_umaban'][hidden_horse_name] = past_umaban
+
+        close_th = 10.0 if is_banei else 1.0
+        already_dived = set(deep_dive_race_ids)
+
+        close_pairs = set()
+        runners = list(umaban_dict.keys())
+        for i in range(len(runners)):
+            for j in range(i + 1, len(runners)):
+                h1, h2 = runners[i], runners[j]
+                shared_diffs = []
+                for rid, rdata in past_races_dict.items():
+                    if h1 in rdata['horses'] and h2 in rdata['horses']:
+                        diff = abs(rdata['horses'][h1] - rdata['horses'][h2])
+                        shared_diffs.append(diff)
+                if shared_diffs:
+                    avg_diff = sum(shared_diffs) / len(shared_diffs)
+                    if avg_diff <= close_th:
+                        close_pairs.add((h1, h2))
+
+        extra_dive_ids = set()
+        for h1, h2 in close_pairs:
+            for rid, rdata in past_races_dict.items():
+                if rid not in already_dived and h1 in rdata['horses'] and h2 in rdata['horses']:
+                    extra_dive_ids.add(rid)
+
+        for past_id in extra_dive_ids:
+            time.sleep(0.5)
+            is_nar_past = self._is_nar_race(past_id)
+
+            db_url = f"https://db.netkeiba.com/race/{past_id}/"
+            res = requests.get(db_url, headers=self.headers)
+            res.encoding = 'EUC-JP'
+            db_soup = BeautifulSoup(res.text, 'html.parser')
             result_table = db_soup.find('table', class_='race_table_01')
 
             if not result_table and is_nar_past:
@@ -269,16 +370,30 @@ class NetkeibaScraper:
         return race_title, target_course, target_track, target_distance, list(past_races_dict.values()), umaban_dict
 
 # ==========================================
-# 新規: 優先度順に履歴をソート（同場同距 > 同場 > 同距 > 他、同条件なら日付が新しい順）
+# 優先順位ソート（大井の内/外判定込み）
 # ==========================================
 def sort_histories(histories, target_course, target_distance):
     def score_hist(h):
         c_match = (h.get('course') == target_course)
         d_match = (str(h.get('distance')) == str(target_distance))
-        if c_match and d_match: p = 3
-        elif c_match: p = 2
-        elif d_match: p = 1
-        else: p = 0
+        
+        p = 0
+        if c_match and d_match:
+            p = 10
+        elif c_match:
+            if target_course == '大井':
+                t_track = get_ooi_track(target_distance)
+                h_track = get_ooi_track(h.get('distance'))
+                if t_track == h_track:
+                    p = 8 # 大井同回り
+                else:
+                    p = 4 # 大井別回り（実質別コース）
+            else:
+                p = 6 # 通常の同場
+        elif d_match:
+            p = 5 # 同距離
+        else:
+            p = 0
         return (p, h.get('date', ''))
     return sorted(histories, key=score_hist, reverse=True)
 
@@ -305,8 +420,8 @@ def build_unified_graph(past_races, target_course, target_track, target_distance
         if not is_distance_in_range(race.get('distance'), target_distance): continue
 
         is_banei = race.get('is_banei', False)
-        
         is_same_course = (race.get('course') == target_course)
+        
         try:
             dist_diff = abs(int(race.get('distance', 0)) - int(target_distance))
         except (ValueError, TypeError):
@@ -314,8 +429,14 @@ def build_unified_graph(past_races, target_course, target_track, target_distance
             
         if is_same_course and dist_diff == 0:
             base_cost = 1   
-        elif is_same_course and dist_diff <= 200:
-            base_cost = 4   
+        elif is_same_course:
+            if target_course == '大井':
+                if get_ooi_track(target_distance) == get_ooi_track(race.get('distance')):
+                    base_cost = 3 if dist_diff <= 200 else 5
+                else:
+                    base_cost = 15 # 大井の内/外違いはペナルティ大
+            else:
+                base_cost = 4 if dist_diff <= 200 else 6
         elif not is_same_course and dist_diff == 0:
             base_cost = 8   
         else:
@@ -402,15 +523,12 @@ def format_horse_name(horse, umaban_dict):
 def get_separator(gap, is_banei):
     gap = abs(gap)
     if is_banei:
-        if gap <= 3.0: return "＝"
-        elif gap <= 7.0: return "＞"
-        elif gap <= 13.0: return "＞＞"
-        else: return "＞＞＞"
+        if gap <= 3.0: return "="
+        else: return ">"
     else:
-        if gap <= 0.2: return "＝"
-        elif gap <= 0.5: return "＞"
-        elif gap <= 0.9: return "＞＞"
-        else: return "＞＞＞"
+        if gap <= 0.2: return "="
+        elif gap <= 0.5: return ">"
+        else: return ">>"
 
 def format_direct_chain(base_horse, current_runners, race_info, is_banei, umaban_dict):
     """同じレースに出ていた全出走馬をタイム順に並べて数式化する"""
@@ -432,7 +550,7 @@ def format_direct_chain(base_horse, current_runners, race_info, is_banei, umaban
         else:
             sign = "+" if diff_to_base > 0 else "-" if diff_to_base < 0 else "±"
             u_str = umaban_dict.get(h, "?")
-            parts.append(f"[{u_str}]{h}({sign}{abs(diff_to_base):.1f})")
+            parts.append(f"{u_str}{h}({sign}{abs(diff_to_base):.1f})")
         
         if i < len(horses_in_race) - 1:
             next_t = horses_in_race[i+1][1]
@@ -639,7 +757,12 @@ def analyze_all_horses_html(G, past_races, umaban_dict, target_course, target_di
                         
                         for rinfo in race_infos:
                             course_str = rinfo.get('course', '不明')
-                            c_short = course_str[0:1] if course_str else "?"
+                            # 大井の場合は内回り/外回りを明記
+                            if course_str == '大井':
+                                c_short = f"大{get_ooi_track(rinfo.get('distance'))}"
+                            else:
+                                c_short = course_str[0:1] if course_str else "?"
+                            
                             link = f"<a href='https://db.netkeiba.com/race/{rinfo.get('race_id')}' target='_blank' style='color:#3498db; text-decoration:none;'>{rinfo.get('date')} {c_short}{rinfo.get('distance')}</a>"
                             chain_str = format_direct_chain(horse, list(component), rinfo, is_banei, umaban_dict)
                             direct_html.append(f"<div style='font-size:0.85em; margin-left:8px; margin-bottom:3px;'>{link}<br>{chain_str}</div>")
@@ -655,7 +778,7 @@ def analyze_all_horses_html(G, past_races, umaban_dict, target_course, target_di
                                 
                                 abs_diff = abs(diff_val)
                                 sep = get_separator(abs_diff, is_banei)
-                                opp_str = format_horse_name(opp, umaban_dict)
+                                opp_str = f"{umaban_dict.get(opp, '?')}{opp}"
                                 
                                 if diff_val >= 0:
                                     hidden_html.append(f"<div style='font-size:0.85em; margin-left:8px;'>[{hidden_names}] 本馬{sep}{opp_str}(+{abs_diff:.1f})</div>")
@@ -699,9 +822,10 @@ def rank_horses(race_id, mark_race_id=None):
     for horse_name in track_unranked:
         ruler_ranks[horse_name] = {"rank": "!", "score": RANK_SCORES["!"], "diff": -1}
 
+    t_track_disp = f"大井({get_ooi_track(target_distance)}回り)" if target_course == '大井' else target_course
     ruler_html = (
         f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
-        f"📊 {target_course} {target_distance}m 基準：能力序列<br>"
+        f"📊 {t_track_disp} {target_distance}m 基準：能力序列<br>"
         f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※直近の同条件レースを最優先。隠れ馬経由はノイズ割引(×0.7)を適用</span></h2>"
         f"{result_html_content}"
     )
@@ -759,10 +883,11 @@ def analyze_single():
             label = "1.9%以下（軽馬場）" if water_mode == 'dry' else "2.0%以上（重馬場）"
             water_note = f"<p style='text-align:center; color:#2980b9; font-size:13px; margin-bottom:15px;'>💧 水分量フィルタ: <strong>{label}</strong> のレースのみ使用</p>"
 
+        t_track_disp = f"大井({get_ooi_track(target_distance)}回り)" if target_course == '大井' else target_course
         result_html = (
             f"{water_note}"
             f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
-            f"📊 {target_course} {target_distance}m 基準：能力序列<br>"
+            f"📊 {t_track_disp} {target_distance}m 基準：能力序列<br>"
             f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※直近の同条件レースを最優先。隠れ馬経由はノイズ割引(×0.7)を適用</span></h2>"
             f"{result_html_content}"
         )
