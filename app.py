@@ -82,7 +82,6 @@ class NetkeibaScraper:
                 d_match = re.search(r'(\d{3,4})', race_data01.text)
                 if d_match: target_distance = d_match.group(1)
         elif race_data01:
-            # 修正: 3桁距離（園田820mなど）に対応するため \d{3,4} に変更
             t_match = re.search(r'(芝|ダ|障)[^\d]*(\d{3,4})', race_data01.text)
             if t_match:
                 t_val = t_match.group(1)
@@ -133,7 +132,6 @@ class NetkeibaScraper:
                             d_match = re.search(r'(\d{3,4})', data05.text)
                             distance = d_match.group(1) if d_match else "不明"
                         else:
-                            # 修正: 過去レースも3桁距離に対応
                             track_match = re.search(r'(芝|ダ|障)[^\d]*(\d{3,4})', data05.text)
                             if track_match:
                                 t_val = track_match.group(1)
@@ -426,7 +424,6 @@ def build_unified_graph(past_races, target_course, target_track, target_distance
 
                 raw_diff = h1_time - h2_time
 
-                # 修正: ばんえいの除外を15秒から30秒へ変更
                 if not is_direct:
                     if is_banei and abs(raw_diff) >= 30.0: continue
                     elif not is_banei and abs(raw_diff) >= 2.0: continue
@@ -659,10 +656,10 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
             try:
                 path = nx.shortest_path(runner_G, source=u, target=v, weight='explore_cost')
                 score = 0.0
-                is_direct = (len(path) == 2)
                 has_target_cond = False
 
-                if is_direct:
+                # ⚠️修正ポイント：本当にG（生データ）に直接の線があるか厳密チェック！
+                if len(path) == 2 and (G.has_edge(u, v) or G.has_edge(v, u)):
                     edge = G[u][v] if G.has_edge(u, v) else G[v][u]
                     same_cond_diffs = [h['raw_diff'] for h in edge['history'] if h['course'] == target_course and h['distance'] == target_distance]
                     if same_cond_diffs:
@@ -708,7 +705,8 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
 
     fastest = min(current_runners, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
     
-    final_scores = {h: adv_matrix[h][fastest] if adv_matrix[h][fastest] != float('inf') else float('inf') for h in currentrunners}
+    # ⚠️修正ポイント：前回のタイポ（currentrunners）を修正
+    final_scores = {h: adv_matrix[h][fastest] if adv_matrix[h][fastest] != float('inf') else float('inf') for h in current_runners}
     ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
 
     return fastest, final_scores, ranked_list, tier_map
@@ -779,7 +777,6 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
                     diff = max(0.0, diff)
                     diff_str = "±0.0" if diff < diff_zero_th else f"+{diff:.1f}"
                     
-                    # 修正: 最上位馬（fastest）に ⭐ を付与
                     is_star = (horse == fastest)
                     star_prefix = "<span style='color:#f1c40f; font-size:1.2em; margin-right:4px;' title='このグループにおける最上位エース馬です'>⭐</span>" if is_star else ""
                     horse_disp = f"{star_prefix}{format_horse_name(horse, umaban_dict, race_id)}"
@@ -842,7 +839,6 @@ def rank_horses(race_id, mark_race_id=None):
     for horse_name in track_unranked:
         ruler_ranks[horse_name] = {"rank": "!", "score": RANK_SCORES["!"], "diff": -1}
 
-    # 第2部表記を完全に削除し、スッキリとした単一UIに統合
     ruler_html = (
         f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
         f"📊 {target_course} {target_distance}m 基準：能力序列<br>"
@@ -903,7 +899,6 @@ def analyze_single():
             label = "1.9%以下（軽馬場）" if water_mode == 'dry' else "2.0%以上（重馬場）"
             water_note = f"<p style='text-align:center; color:#2980b9; font-size:13px; margin-bottom:15px;'>💧 水分量フィルタ: <strong>{label}</strong> のレースのみ使用</p>"
 
-        # 第2部表記を完全に削除
         result_html = (
             f"{water_note}"
             f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
