@@ -4,11 +4,11 @@ import re
 import sys
 import os
 
-# app.py からロジック部分のみインポート（Flaskルートは使わない）
+# app.py から統合版のロジック部分のみインポート
 sys.path.insert(0, os.path.dirname(__file__))
 from app import (
     NetkeibaScraper,
-    build_measuring_stick_graph,
+    build_unified_graph,        # ← ここを変更！
     analyze_all_horses_html,
 )
 
@@ -18,7 +18,7 @@ from app import (
 PAGE_STYLE = """
 <style>
   body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #f7f6f2; margin: 0; padding: 10px; color: #333; }
-  .section-title { background-color: #7b8d7a; color: white; padding: 10px 15px; border-radius: 6px;
+  .section-title { background-color: #2c3e50; color: white; padding: 10px 15px; border-radius: 6px;
                    font-size: 15px; margin-top: 20px; margin-bottom: 15px; }
   .horse-rank { margin-bottom: 18px; padding-bottom: 10px; border-bottom: 1px dashed #ccc; }
   .rank-title { font-size: 15px; margin: 0 0 5px 0; color: #2c3e50; }
@@ -58,37 +58,28 @@ def run_analysis(race_id: str, water_mode: str | None = None):
 
     is_banei = (target_track == "ばんえい")
 
-    G_course = build_measuring_stick_graph(
-        past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=True
+    # 第1部・第2部を分けるのをやめ、統合グラフを1つだけ作る
+    G_unified = build_unified_graph(
+        past_races, target_course, target_track, target_distance, umaban_dict
     )
-    result_course, _, _, _, _ = analyze_all_horses_html(
-        G_course, umaban_dict, target_course, target_distance, race_id=None, is_banei=is_banei
+    
+    # 解析処理を実行
+    result_html_content, _, _, _, _ = analyze_all_horses_html(
+        G_unified, umaban_dict, target_course, target_distance, race_id=None, is_banei=is_banei
     )
 
-    if is_banei:
-        water_note = ""
-        if water_mode:
-            label = "1.9%以下（軽馬場）" if water_mode == "dry" else "2.0%以上（重馬場）"
-            water_note = f"<p style='color:#2980b9; font-size:13px;'>💧 水分量フィルタ: <strong>{label}</strong></p>"
-        result_html = (
-            f"{water_note}"
-            f"<h2 class='section-title'>帯広ばんえい {target_distance}m での比較</h2>"
-            f"{result_course}"
-        )
-    else:
-        G_track = build_measuring_stick_graph(
-            past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=False
-        )
-        result_track, _, _, _, _ = analyze_all_horses_html(
-            G_track, umaban_dict, target_course, target_distance, race_id=None, is_banei=False
-        )
-        result_html = (
-            f"<h2 class='section-title'>【第1部】同コース（{target_course}）での比較</h2>"
-            f"{result_course}"
-            f"<h2 class='section-title'>【第2部】全国の競馬場（{target_track}）での比較<br>"
-            f"<span style='font-size:0.75em; font-weight:normal;'>※適性(コース/距離)が近い過去レースを優先</span></h2>"
-            f"{result_track}"
-        )
+    water_note = ""
+    if is_banei and water_mode:
+        label = "1.9%以下（軽馬場）" if water_mode == "dry" else "2.0%以上（重馬場）"
+        water_note = f"<p style='color:#2980b9; font-size:13px;'>💧 水分量フィルタ: <strong>{label}</strong></p>"
+        
+    # 第2部表記を削り、統合版の1つのヘッダーで出力する
+    result_html = (
+        f"{water_note}"
+        f"<h2 class='section-title'>📊 {target_course} {target_distance}m 基準：能力序列<br>"
+        f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※同条件の直接対決を絶対視し、間接比較には0.7倍のノイズ割引を適用</span></h2>"
+        f"{result_html_content}"
+    )
 
     return race_title, result_html
 
