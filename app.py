@@ -657,8 +657,8 @@ def build_runner_graph(undirected_G, umaban_dict, is_banei=False):
 
 def _rank_component(G, runner_G, component, umaban_dict, target_course, target_distance, is_banei=False):
     current_runners = list(component)
-    # 勝敗を分ける閾値（これ以上のタイム差をつけられたら「明確な負け」とする）
-    loss_th = 3.0 if is_banei else 0.2
+    # 「互角」とみなして同じランクに引き上げるタイム差の閾値（0.2秒以下なら同ランク）
+    tie_th = 3.0 if is_banei else 0.2 
 
     adv_matrix = {u: {v: 0.0 for v in current_runners} for u in current_runners}
 
@@ -692,40 +692,37 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                 adv_matrix[u][v] = float('inf')
 
     # ==================================================
-    # 👑 新ロジック：勝ち残りトーナメント（トポロジカル・ソート）
+    # 👑 超進化版：アンカー（絶対基準）主導の相対クラスタリング
     # ==================================================
     pool = set(current_runners)
     tier_map = {}
     
     for tier in ["S", "A", "B"]:
         if not pool: break
-        candidates = []
+        
+        # プール内で一番強い（他馬へのタイム差平均が最小）馬を「その階層のアンカー」とする
+        best_anchor = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
+        
+        # アンカー自身を階層に追加
+        tier_map[best_anchor] = tier
+        pool.remove(best_anchor)
+        
+        # アンカーと互角（タイム差が tie_th 以内、またはアンカーより速い）の馬を同じ階層に引き上げる
+        tied_horses = []
         for h in pool:
-            has_loss = False
-            for opp in pool:
-                if h == opp: continue
-                # h が opp より明確に遅い（閾値以上のタイム差をつけられている）場合、hは「負け」
-                if adv_matrix[h][opp] != float('inf') and adv_matrix[h][opp] > loss_th:
-                    has_loss = True
-                    break
-            
-            # 誰にも負けていない馬が、この階層のトップ（無敗馬）になる
-            if not has_loss:
-                candidates.append(h)
+            # adv_matrix[h][best_anchor] <= tie_th なら「互角」
+            if adv_matrix[h][best_anchor] != float('inf') and adv_matrix[h][best_anchor] <= tie_th:
+                tied_horses.append(h)
                 
-        # 三すくみ（A>B>C>A）などで全員に負けがついてしまった場合のセーフティネット
-        if not candidates:
-            best_h = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
-            candidates = [best_h]
+        for h in tied_horses:
+            tier_map[h] = tier
+            pool.remove(h)
             
-        for c in candidates:
-            tier_map[c] = tier
-            pool.remove(c)
-            
+    # 残った馬は全員Cランク
     for h in pool:
         tier_map[h] = "C"
 
-    # 集団のリーダー（UI表示用の基準馬）は、Sランクの中から一番タイム差が優秀な馬を選ぶ
+    # 全体の最速馬（UI表示のベース）
     s_tier_horses = [h for h, t in tier_map.items() if t == "S"]
     if not s_tier_horses: s_tier_horses = current_runners
     fastest = min(s_tier_horses, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
