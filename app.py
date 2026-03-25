@@ -271,7 +271,7 @@ class NetkeibaScraper:
                     if not past_races_dict[past_id]['past_umaban'].get(hidden_horse_name):
                         past_races_dict[past_id]['past_umaban'][hidden_horse_name] = past_umaban
 
-        # === 第2パス: 接戦ペア（1.0秒以内）の追加直接対決レースを深掘り ===
+        # 接戦ペアの追加深掘り
         close_th = 10.0 if is_banei else 1.0
         already_dived = set(deep_dive_race_ids)
 
@@ -304,7 +304,6 @@ class NetkeibaScraper:
             res = requests.get(db_url, headers=self.headers)
             res.encoding = 'EUC-JP'
             db_soup = BeautifulSoup(res.text, 'html.parser')
-
             result_table = db_soup.find('table', class_='race_table_01')
 
             if not result_table and is_nar_past:
@@ -326,7 +325,6 @@ class NetkeibaScraper:
 
                 rank_str = tds[0].text.strip()
                 if not rank_str.isdigit(): continue
-
                 past_umaban = tds[2].text.strip()
 
                 horse_cell = tds[3]
@@ -345,27 +343,24 @@ class NetkeibaScraper:
                             time_str = txt
                             break
                 if time_str is None: continue
-
                 sec = self.convert_time_to_sec(time_str)
                 if sec is None: continue
 
                 if winner_sec is None:
                     winner_sec = sec
-
                 time_behind = round(sec - winner_sec, 1)
 
                 if past_id in past_races_dict:
                     past_races_dict[past_id]['horses'][hidden_horse_name] = time_behind
                     if 'past_umaban' not in past_races_dict[past_id]:
                         past_races_dict[past_id]['past_umaban'] = {}
-
                     if not past_races_dict[past_id]['past_umaban'].get(hidden_horse_name):
                         past_races_dict[past_id]['past_umaban'][hidden_horse_name] = past_umaban
 
         return race_title, target_course, target_track, target_distance, list(past_races_dict.values()), umaban_dict
 
 # ==========================================
-# 2. ネットワーク構築
+# 2. ネットワーク構築（第1部・第2部統合版）
 # ==========================================
 def is_distance_in_range(race_distance, target_distance):
     try:
@@ -380,16 +375,15 @@ def is_distance_in_range(race_distance, target_distance):
     else:
         return True
 
-def build_measuring_stick_graph(past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=False):
+def build_unified_graph(past_races, target_course, target_track, target_distance, umaban_dict):
     G = nx.DiGraph()
     for race in past_races:
-        if is_course_only and race['course'] != target_course: continue
-        if not is_course_only and race['track_type'] != target_track: continue
+        if race['track_type'] != target_track: continue
         if not is_distance_in_range(race['distance'], target_distance): continue
 
         is_banei = race.get('is_banei', False)
         
-        # 探索優先度コスト設定（①・②・③の重み付け）
+        # 統合探索の最重要ポイント：同場・同距離を圧倒的に優遇
         is_same_course = (race['course'] == target_course)
         try:
             dist_diff = abs(int(race['distance']) - int(target_distance))
@@ -397,13 +391,13 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
             dist_diff = 9999
             
         if is_same_course and dist_diff == 0:
-            base_cost = 1  # ①同場・同距離（最優先）
+            base_cost = 1   # ①最優先（同場・同距）
         elif is_same_course and dist_diff <= 200:
-            base_cost = 5  # ②近距離・同場
+            base_cost = 4   # ②場優先
         elif not is_same_course and dist_diff == 0:
-            base_cost = 8  # ②同距離・別場
+            base_cost = 8   # ③距離優先
         else:
-            base_cost = 20 # ③その他
+            base_cost = 20  # ④その他
 
         cap_val = 30.0 if is_banei else 10.0
 
@@ -431,184 +425,100 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
 
                 raw_diff = h1_time - h2_time
 
-                # 【重要修正】隠れ馬（物差し馬）の場合は、着差2秒以上（ばんえいは15秒以上）は使わない
                 if not is_direct:
-                    if is_banei and abs(raw_diff) >= 30.0:
-                        continue
-                    elif not is_banei and abs(raw_diff) >= 2.0:
-                        continue
+                    if is_banei and abs(raw_diff) >= 30.0: continue
+                    elif not is_banei and abs(raw_diff) >= 2.0: continue
 
-                if raw_diff < 0:
-                    capped_diff = max(-cap_val, raw_diff)
-                else:
-                    capped_diff = min(cap_val, raw_diff)
+                capped_diff = max(-cap_val, raw_diff) if raw_diff < 0 else min(cap_val, raw_diff)
 
                 worse_time = max(h1_time, h2_time)
-                
-                if is_banei:
-                    reliability_penalty = 0
-                elif worse_time <= 0.5:
-                    reliability_penalty = 0
-                elif worse_time <= 1.0:
-                    reliability_penalty = 5
-                else:
-                    reliability_penalty = 15
+                if is_banei: reliability_penalty = 0
+                elif worse_time <= 0.5: reliability_penalty = 0
+                elif worse_time <= 1.0: reliability_penalty = 5
+                else: reliability_penalty = 15
 
-                if is_direct:
-                    edge_cost = base_cost + reliability_penalty
-                else:
-                    edge_cost = base_cost + 100 + reliability_penalty # 隠れ馬経由にはペナルティ大
-
-                h1_past_umaban = race.get('past_umaban', {}).get(h1_name, "")
-                h2_past_umaban = race.get('past_umaban', {}).get(h2_name, "")
+                # 隠れ馬ペナルティを重くし、極力直接対決を優先させる
+                edge_cost = (base_cost + reliability_penalty) if is_direct else (base_cost + 100 + reliability_penalty)
 
                 history_item = {
-                    'date': race['date'],
-                    'race_id': race['race_id'],
-                    'course': race['course'],
-                    'distance': race['distance'],
-                    'raw_diff': raw_diff,
-                    'diff': capped_diff,
-                    'h1_name': h1_name,
-                    'h2_name': h2_name,
-                    'h1_past_umaban': h1_past_umaban,
-                    'h2_past_umaban': h2_past_umaban,
-                    'h1_time': h1_time,
-                    'h2_time': h2_time
+                    'date': race['date'], 'race_id': race['race_id'], 'course': race['course'],
+                    'distance': race['distance'], 'raw_diff': raw_diff, 'diff': capped_diff,
+                    'h1_name': h1_name, 'h2_name': h2_name,
+                    'h1_past_umaban': race.get('past_umaban', {}).get(h1_name, ""),
+                    'h2_past_umaban': race.get('past_umaban', {}).get(h2_name, ""),
+                    'h1_time': h1_time, 'h2_time': h2_time
                 }
 
                 if G.has_edge(h1_name, h2_name):
                     current_cost = G[h1_name][h2_name]['explore_cost']
                     edge_data = G[h1_name][h2_name]
-
-                    if is_direct:
-                        edge_data['diffs'].append(capped_diff)
-                        edge_data['history'].append(history_item)
-                        edge_data['rank_diff'] = sum(edge_data['diffs']) / len(edge_data['diffs'])
-                        if edge_cost < current_cost:
-                            edge_data['explore_cost'] = edge_cost
-                            edge_data['race_id'] = race['race_id']
-                            edge_data['course'] = race['course']
-                            edge_data['distance'] = race['distance']
-                            edge_data['track_type'] = race['track_type']
-                            edge_data['date'] = race['date']
-                            edge_data['h1_time'] = h1_time
-                            edge_data['h2_time'] = h2_time
-                        best_base = min(edge_cost, current_cost)
-                        if len(edge_data['diffs']) >= 2:
-                            var = statistics.variance(edge_data['diffs'])
-                            edge_data['explore_cost'] = best_base + var * 100
-                        else:
-                            edge_data['explore_cost'] = best_base
-                    else:
-                        if edge_cost < current_cost:
-                            edge_data['diffs'] = [capped_diff]
-                            edge_data['history'] = [history_item]
-                            edge_data['rank_diff'] = capped_diff
-                            edge_data['explore_cost'] = edge_cost
-                            edge_data['race_id'] = race['race_id']
-                            edge_data['course'] = race['course']
-                            edge_data['distance'] = race['distance']
-                            edge_data['track_type'] = race['track_type']
-                            edge_data['date'] = race['date']
-                            edge_data['h1_time'] = h1_time
-                            edge_data['h2_time'] = h2_time
-                        elif edge_cost == current_cost:
-                            edge_data['diffs'].append(capped_diff)
-                            edge_data['history'].append(history_item)
-                            edge_data['rank_diff'] = sum(edge_data['diffs']) / len(edge_data['diffs'])
-                            if len(edge_data['diffs']) >= 2:
-                                var = statistics.variance(edge_data['diffs'])
-                                edge_data['explore_cost'] = edge_cost + var * 100
+                    edge_data['diffs'].append(capped_diff)
+                    edge_data['history'].append(history_item)
+                    edge_data['rank_diff'] = sum(edge_data['diffs']) / len(edge_data['diffs'])
+                    
+                    if edge_cost < current_cost:
+                        edge_data['explore_cost'] = edge_cost
+                        for k in ['race_id', 'course', 'distance', 'track_type', 'date', 'h1_time', 'h2_time']:
+                            edge_data[k] = race.get(k) if k in race else locals().get(k)
+                    
+                    if len(edge_data['diffs']) >= 2:
+                        var = statistics.variance(edge_data['diffs'])
+                        edge_data['explore_cost'] = min(edge_cost, current_cost) + var * 100
                 else:
                     G.add_edge(h1_name, h2_name, weight=1, diffs=[capped_diff], history=[history_item], rank_diff=capped_diff,
-                               explore_cost=edge_cost,
-                               race_id=race['race_id'], course=race['course'],
+                               explore_cost=edge_cost, race_id=race['race_id'], course=race['course'],
                                distance=race['distance'], track_type=race['track_type'],
                                date=race['date'], h1_time=h1_time, h2_time=h2_time)
     return G
 
 # ==========================================
-# 3. ランク階層生成 ＆ 出力処理
+# 3. ランク階層生成（勝敗相殺・同条件優先ロジック）
 # ==========================================
 def format_horse_name(horse, umaban_dict, race_id=None):
     if horse in umaban_dict:
         mark = f"<mark-selector race='{race_id}' horse='{horse}'></mark-selector>" if race_id else ""
         return f"{mark}[{umaban_dict[horse]}] {horse}"
-    else:
-        return f"[隠] {horse}"
+    return f"[隠] {horse}"
 
-def get_rank_tier(diff, is_banei=False):
-    """Fallback Tier assignment (used only for missing/isolated mapping)"""
-    r_diff = round(diff, 1)
-    if is_banei:
-        if r_diff <= 3.0: return "S"
-        elif r_diff <= 8.0: return "A"
-        elif r_diff <= 15.0: return "B"
-        else: return "C"
-    else:
-        if r_diff <= 0.2: return "S"
-        elif r_diff <= 0.7: return "A"
-        elif r_diff <= 1.5: return "B"
-        else: return "C"
-
-# 複数ルート（クロスチェック）を加味してタイムを平均化する処理
 def calc_path_score(G, path, target_course=None, target_distance=None):
     score = 0.0
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
-        if G.has_edge(u, v):
-            edge = G[u][v]
-            if target_course and target_distance and 'history' in edge:
-                same_diffs = [h['diff'] for h in edge['history']
-                              if h['course'] == target_course and h['distance'] == target_distance]
-                other_diffs = [h['diff'] for h in edge['history']
-                               if h['course'] != target_course or h['distance'] != target_distance]
-                if same_diffs:
-                    all_weighted = same_diffs * 2 + other_diffs
-                    weighted_avg = sum(all_weighted) / len(all_weighted)
-                    score -= weighted_avg
-                else:
-                    score -= edge['rank_diff']
+        edge = G[u][v] if G.has_edge(u, v) else G[v][u]
+        
+        if target_course and target_distance and 'history' in edge:
+            same_diffs = [h['diff'] for h in edge['history'] if h['course'] == target_course and h['distance'] == target_distance]
+            other_diffs = [h['diff'] for h in edge['history'] if h['course'] != target_course or h['distance'] != target_distance]
+            if same_diffs:
+                all_weighted = same_diffs * 3 + other_diffs # 同条件をさらに重み付け
+                weighted_avg = sum(all_weighted) / len(all_weighted)
+                val = weighted_avg
             else:
-                score -= edge['rank_diff']
+                val = edge['rank_diff']
         else:
-            edge = G[v][u]
-            if target_course and target_distance and 'history' in edge:
-                same_diffs = [h['diff'] for h in edge['history']
-                              if h['course'] == target_course and h['distance'] == target_distance]
-                other_diffs = [h['diff'] for h in edge['history']
-                               if h['course'] != target_course or h['distance'] != target_distance]
-                if same_diffs:
-                    all_weighted = same_diffs * 2 + other_diffs
-                    weighted_avg = sum(all_weighted) / len(all_weighted)
-                    score += weighted_avg
-                else:
-                    score += edge['rank_diff']
-            else:
-                score += edge['rank_diff']
+            val = edge['rank_diff']
+            
+        if not G.has_edge(u, v):
+            val = -val # 逆方向の場合
+            
+        score += val
                 
-    # 【重要修正】隠れ馬（複数エッジ）経由の比較はノイズを減らすため0.7倍に割引
+    # 隠れ馬（複数エッジ）経由の比較はノイズを減らすため0.7倍に割引（リスク低減）
     if len(path) > 2:
         score *= 0.7
-        
     return score
 
 def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, is_banei=False):
     parts = []
     is_hidden_comparison = len(runner_path) > 2
-    
     for k in range(len(runner_path) - 1):
         u, v = runner_path[k], runner_path[k+1]
         edge_paths = runner_G[u][v].get('multiple_paths', [runner_G[u][v]['full_path']])
         
-        hop_scores = []
-        for p in edge_paths:
-            p_oriented = p if p[0] == u else p[::-1]
-            hop_scores.append(calc_path_score(G, p_oriented))
+        hop_scores = [calc_path_score(G, p if p[0] == u else p[::-1]) for p in edge_paths]
         avg_score = sum(hop_scores) / len(hop_scores)
-        
         gap = abs(avg_score)
+        
         if is_banei:
             if gap <= 3.0: sep = " ＝ "
             elif gap <= 7.0: sep = " ＞ "
@@ -620,21 +530,16 @@ def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, i
             elif gap <= 0.9: sep = " ＞＞ "
             else: sep = " ＞＞＞ "
         
-        if k == 0:
-            parts.append(format_horse_name(u, umaban_dict, race_id))
-            
+        if k == 0: parts.append(format_horse_name(u, umaban_dict, race_id))
         discount_badge = "<span style='color:#9b59b6; font-size:0.8em; font-weight:bold;'>[隠れ馬割引適用]</span> " if is_hidden_comparison and k == len(runner_path) - 2 else ""
         
         if len(edge_paths) > 1:
             parts.append(f"{sep}<span style='color:#e67e22; font-size:0.85em;'>[複数ルート加味]</span>{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
         else:
             p = edge_paths[0]
-            p_oriented = p if p[0] == u else p[::-1]
-            middle_nodes = p_oriented[1:-1]
-            for m in middle_nodes:
+            for m in (p if p[0] == u else p[::-1])[1:-1]:
                 parts.append(f"{sep}{format_horse_name(m, umaban_dict, race_id)}")
             parts.append(f"{sep}{discount_badge}{format_horse_name(v, umaban_dict, race_id)}")
-            
     return "".join(parts)
 
 def render_path_details(G, runner_path, runner_G, umaban_dict, target_course, target_distance, race_id=None, is_banei=False):
@@ -654,50 +559,36 @@ def render_path_details(G, runner_path, runner_G, umaban_dict, target_course, ta
                 p_oriented = p if p[0] == u else p[::-1]
                 details.append(f"      <li style='list-style-type:none; margin-left:-5px; color:#2980b9; font-size:0.85em; margin-top:3px;'>【ルート{idx+1}】</li>")
                 details.extend(_render_single_path_details(G, p_oriented, umaban_dict, target_course, target_distance, race_id, is_banei, indent=True))
-                
     return details
 
 def _render_single_path_details(G, path, umaban_dict, target_course, target_distance, race_id=None, is_banei=False, indent=False):
-    close_th = 3.0 if is_banei else 0.2
-    near_th = 7.0 if is_banei else 0.5
-    far_th = 13.0 if is_banei else 0.9
-    draw_th = 2.0 if is_banei else 0.1
-
+    close_th, near_th, far_th, draw_th = (3.0, 7.0, 13.0, 2.0) if is_banei else (0.2, 0.5, 0.9, 0.1)
     details = []
     li_style = " style='margin-left: 15px; font-size: 0.9em; color: #555; list-style-type: circle;'" if indent else ""
 
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
-
-        if G.has_edge(u, v):
-            edge = G[u][v]
-            h1, h2 = u, v
-        else:
-            edge = G[v][u]
-            h1, h2 = v, u
+        edge = G[u][v] if G.has_edge(u, v) else G[v][u]
+        h1, h2 = (u, v) if G.has_edge(u, v) else (v, u)
 
         if edge['rank_diff'] < 0:
             winner, loser = h1, h2
-            winner_time = edge['h1_time']
-            loser_time = edge['h2_time']
+            winner_time, loser_time = edge['h1_time'], edge['h2_time']
             wins = sum(1 for h in edge['history'] if h['raw_diff'] < -draw_th)
             losses = sum(1 for h in edge['history'] if h['raw_diff'] > draw_th)
         else:
             winner, loser = h2, h1
-            winner_time = edge['h2_time']
-            loser_time = edge['h1_time']
+            winner_time, loser_time = edge['h2_time'], edge['h1_time']
             wins = sum(1 for h in edge['history'] if h['raw_diff'] > draw_th)
             losses = sum(1 for h in edge['history'] if h['raw_diff'] < -draw_th)
 
         num_matches = len(edge['history'])
         draws = num_matches - wins - losses
-
         record_str = f" <span style='color:#8e44ad; font-weight:bold;'>[{num_matches}戦：{wins}勝{losses}敗{draws}分]</span>" if num_matches > 1 else ""
 
         margin = abs(edge['rank_diff'])
         w_disp = format_horse_name(winner, umaban_dict, race_id)
         l_disp = format_horse_name(loser, umaban_dict, race_id)
-
         w_disp_time = f"{w_disp}(+{winner_time:.1f})" if winner_time > 0 else f"{w_disp}(±0.0)"
         l_disp_time = f"{l_disp}(+{loser_time:.1f})" if loser_time > 0 else f"{l_disp}(±0.0)"
 
@@ -709,42 +600,21 @@ def _render_single_path_details(G, path, umaban_dict, target_course, target_dist
         is_same_dist = (edge['distance'] == target_distance)
         star_mark = " <span title='同条件での接戦です。レース内容を要確認！' style='font-size: 1em;'>⭐️</span>" if is_close_race and (is_same_course or is_same_dist) else ""
 
-        match_badge = ""
-        if is_same_course and is_same_dist:
-            match_badge = " <span style='color:#e74c3c;font-weight:bold;'>[場×距]</span>"
-        elif is_same_course:
-            match_badge = " <span style='color:#e67e22;font-weight:bold;'>[場同]</span>"
-        elif is_same_dist:
-            match_badge = " <span style='color:#27ae60;font-weight:bold;'>[距同]</span>"
-        else:
-            match_badge = " <span style='color:#95a5a6;font-size:0.85em;'>[別条件]</span>"
+        match_badge = " <span style='color:#e74c3c;font-weight:bold;'>[場×距]</span>" if is_same_course and is_same_dist else \
+                      " <span style='color:#e67e22;font-weight:bold;'>[場同]</span>" if is_same_course else \
+                      " <span style='color:#27ae60;font-weight:bold;'>[距同]</span>" if is_same_dist else \
+                      " <span style='color:#95a5a6;font-size:0.85em;'>[別条件]</span>"
+        link = f"<a href='{url}' target='_blank' class='race-link' style='color: #3498db; text-decoration: none; font-weight: bold;'>{race_str}</a>{match_badge}{star_mark}"
 
-        match_badge += star_mark
-
-        link = f"<a href='{url}' target='_blank' class='race-link' style='color: #3498db; text-decoration: none; font-weight: bold;'>{race_str}</a>{match_badge}"
-
-        if num_matches == 1:
-            if margin <= close_th:
-                details.append(f"      <li{li_style}>{link} で {w_disp_time} ＝ {l_disp_time}</li>")
-            elif margin <= near_th:
-                details.append(f"      <li{li_style}>{link} で <strong>{w_disp_time}</strong> ＞ {l_disp_time}</li>")
-            elif margin <= far_th:
-                details.append(f"      <li{li_style}>{link} で <strong>{w_disp_time}</strong> ＞＞ {l_disp_time}</li>")
-            else:
-                details.append(f"      <li{li_style}>{link} で <strong>{w_disp_time}</strong> ＞＞＞ {l_disp_time}</li>")
-        else:
-            if margin <= close_th:
-                details.append(f"      <li{li_style}>{link} 等で {w_disp} ＝ {l_disp} {record_str}</li>")
-            elif margin <= near_th:
-                details.append(f"      <li{li_style}>{link} 等で <strong>{w_disp}</strong> ＞ {l_disp} {record_str}</li>")
-            elif margin <= far_th:
-                details.append(f"      <li{li_style}>{link} 等で <strong>{w_disp}</strong> ＞＞ {l_disp} {record_str}</li>")
-            else:
-                details.append(f"      <li{li_style}>{link} 等で <strong>{w_disp}</strong> ＞＞＞ {l_disp} {record_str}</li>")
+        rel = "＝" if margin <= close_th else "＞" if margin <= near_th else "＞＞" if margin <= far_th else "＞＞＞"
+        strong_w = w_disp_time if num_matches == 1 else w_disp
+        strong_w = f"<strong>{strong_w}</strong>" if margin > close_th else strong_w
+        
+        txt = f" で {strong_w} {rel} {l_disp_time}" if num_matches == 1 else f" 等で {strong_w} {rel} {l_disp} {record_str}"
+        details.append(f"      <li{li_style}>{link}{txt}</li>")
                 
     if len(path) > 2:
         details.append(f"      <li{li_style}><span style='color:#9b59b6; font-size:0.85em; font-weight:bold;'>※上記合計タイム差に対して、隠れ馬ノイズ割引（×0.7）が適用されています。</span></li>")
-                
     return details
 
 def build_runner_graph(undirected_G, umaban_dict, is_banei=False):
@@ -752,118 +622,102 @@ def build_runner_graph(undirected_G, umaban_dict, is_banei=False):
     current_runners = [h for h in umaban_dict.keys() if h in undirected_G.nodes()]
     decisive_th = 10.0 if is_banei else 1.1
 
-    for h in current_runners:
-        runner_G.add_node(h)
+    for h in current_runners: runner_G.add_node(h)
 
     for i in range(len(current_runners)):
         for j in range(i + 1, len(current_runners)):
             u, v = current_runners[i], current_runners[j]
-
             if undirected_G.has_edge(u, v):
                 edge_data = undirected_G[u][v]
                 cost = edge_data.get('explore_cost', 10)
-                margin = abs(edge_data.get('rank_diff', 0))
-
-                if margin >= decisive_th:
-                    runner_G.add_edge(u, v, explore_cost=cost, full_path=[u, v], multiple_paths=[[u, v]])
-                else:
-                    runner_G.add_edge(u, v, explore_cost=cost, full_path=[u, v], multiple_paths=[[u, v]])
+                runner_G.add_edge(u, v, explore_cost=cost, full_path=[u, v], multiple_paths=[[u, v]])
             else:
                 try:
                     paths = list(nx.all_simple_paths(undirected_G, source=u, target=v, cutoff=3))
                     valid_paths = []
                     for path in paths:
-                        middle_nodes = path[1:-1]
-                        if any(node in umaban_dict for node in middle_nodes):
-                            continue
+                        if any(node in umaban_dict for node in path[1:-1]): continue
                         cost = sum(undirected_G[path[k]][path[k+1]]['explore_cost'] for k in range(len(path)-1))
                         valid_paths.append((path, cost))
-
                     if valid_paths:
                         valid_paths.sort(key=lambda x: x[1])
                         top_paths = [p[0] for p in valid_paths[:3]]
-                        best_cost = valid_paths[0][1]
-                        runner_G.add_edge(u, v, explore_cost=best_cost, full_path=top_paths[0], multiple_paths=top_paths)
+                        runner_G.add_edge(u, v, explore_cost=valid_paths[0][1], full_path=top_paths[0], multiple_paths=top_paths)
                 except nx.NetworkXNoPath:
                     pass
-
     return runner_G
 
 def _rank_component(G, runner_G, component, umaban_dict, target_course, target_distance, is_banei=False):
     current_runners = list(component)
+    # 明確な能力差と判定する閾値（これ未満なら勝負付け未済として同列扱いにする）
+    decisive_th = 4.0 if is_banei else 0.4 
 
-    pair_scores = {}
+    adv_matrix = {u: {v: 0.0 for v in current_runners} for u in current_runners}
+
     for u in current_runners:
-        pair_scores[u] = {}
         for v in current_runners:
-            if u == v:
-                pair_scores[u][v] = 0.0
-                continue
+            if u == v: continue
             try:
-                runner_path = nx.shortest_path(runner_G, source=u, target=v, weight='explore_cost')
-                total_score = 0.0
-                for k in range(len(runner_path) - 1):
-                    hop_u, hop_v = runner_path[k], runner_path[k+1]
-                    edge_paths = runner_G[hop_u][hop_v].get('multiple_paths', [runner_G[hop_u][hop_v]['full_path']])
-                    hop_scores = []
-                    for p in edge_paths:
-                        p_oriented = p if p[0] == hop_u else p[::-1]
-                        hop_scores.append(calc_path_score(G, p_oriented, target_course, target_distance))
-                    total_score += sum(hop_scores) / len(hop_scores)
-                pair_scores[u][v] = total_score
+                path = nx.shortest_path(runner_G, source=u, target=v, weight='explore_cost')
+                score = 0.0
+                is_direct = (len(path) == 2)
+                has_target_cond = False
+
+                # ① 同場同距の直接対決があれば、その結果を絶対視する
+                if is_direct:
+                    edge = G[u][v] if G.has_edge(u, v) else G[v][u]
+                    same_cond_diffs = [h['raw_diff'] for h in edge['history'] if h['course'] == target_course and h['distance'] == target_distance]
+                    if same_cond_diffs:
+                        avg_diff = sum(same_cond_diffs) / len(same_cond_diffs)
+                        score = avg_diff if G.has_edge(u, v) else -avg_diff
+                        has_target_cond = True
+
+                # ② それ以外はルートを加味した通常のスコア計算（0.7倍割引適用済み）
+                if not has_target_cond:
+                    edge_paths = runner_G[u][v].get('multiple_paths', [runner_G[u][v]['full_path']])
+                    hop_scores = [calc_path_score(G, p if p[0] == u else p[::-1], target_course, target_distance) for p in edge_paths]
+                    score = sum(hop_scores) / len(hop_scores)
+
+                adv_matrix[u][v] = score # マイナスなら u が v より速い
             except nx.NetworkXNoPath:
-                pair_scores[u][v] = float('inf')
+                adv_matrix[u][v] = float('inf')
 
-    best_anchor = None
-    best_neg_sum = -float('inf')
-    
-    for candidate in current_runners:
-        scores = pair_scores[candidate]
-        finite = [s for s in scores.values() if s != float('inf')]
-        if not finite: continue
-        neg_sum = sum(s for s in finite if s < 0)
-        if neg_sum > best_neg_sum:
-            best_neg_sum = neg_sum
-            best_anchor = candidate
-            
-    fastest = best_anchor
-    final_scores = pair_scores[fastest].copy()
-    
-    min_score = min(s for s in final_scores.values() if s != float('inf'))
-    if min_score < -0.01:
-        true_fastest = min([h for h in final_scores if final_scores[h] != float('inf')], key=final_scores.get)
-        fastest = true_fastest
-        final_scores = pair_scores[fastest].copy()
-        
-        min_score = min(s for s in final_scores.values() if s != float('inf'))
-        if min_score < -0.01:
-            for h in final_scores:
-                if final_scores[h] != float('inf'):
-                    final_scores[h] -= min_score
-
-    ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
-
-    # === 【重要修正】Sを基準とした厳格なA/B/C序列化（トップからの0.7倍加味タイム差で決定） ===
+    # 【絶対的階層化ロジック】勝敗相殺による同列化
+    pool = set(current_runners)
     tier_map = {}
-    for h, score in final_scores.items():
-        if score == float('inf'):
-            tier_map[h] = "C"
-            continue
+    
+    for tier in ["S", "A", "B"]:
+        if not pool: break
+        candidates = []
+        for h in pool:
+            has_loss = False
+            for opp in pool:
+                if h == opp: continue
+                # 明確な着差（decisive_th）をつけられて負けている場合は、その階層には入れない
+                if adv_matrix[h][opp] > decisive_th:
+                    has_loss = True
+                    break
+            if not has_loss:
+                candidates.append(h)
+                
+        # 三すくみ等で誰も該当しない場合は、プール内で一番マイナス（他馬より速い）合計値を持つ馬を選ぶ
+        if not candidates:
+            best_h = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
+            candidates = [best_h]
             
-        diff = max(0.0, score - final_scores[fastest])
-        if h == fastest:
-            tier_map[h] = "S"
-        else:
-            if is_banei:
-                if diff <= 3.0: tier_map[h] = "S"
-                elif diff <= 8.0: tier_map[h] = "A"
-                elif diff <= 15.0: tier_map[h] = "B"
-                else: tier_map[h] = "C"
-            else:
-                if diff <= 0.2: tier_map[h] = "S"
-                elif diff <= 0.7: tier_map[h] = "A"
-                elif diff <= 1.5: tier_map[h] = "B"
-                else: tier_map[h] = "C"
+        for c in candidates:
+            tier_map[c] = tier
+            pool.remove(c)
+            
+    for h in pool:
+        tier_map[h] = "C"
+
+    #UI表示用の「集団内最速馬（基準馬）」の選定
+    fastest = min(current_runners, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
+    
+    # タイム差表示用スコア
+    final_scores = {h: adv_matrix[h][fastest] if adv_matrix[h][fastest] != float('inf') else float('inf') for h in current_runners}
+    ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
 
     return fastest, final_scores, ranked_list, tier_map
 
@@ -883,7 +737,7 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
     diff_zero_th = 0.5 if is_banei else 0.05
     unit_label = "秒差換算"
     tier_colors = {"S": "#e74c3c", "!": "#9b59b6", "A": "#e67e22", "B": "#f1c40f", "C": "#3498db"}
-    tier_labels_map = {"S": "🏆 Sランク", "!": "❗ ！ランク（測定不能）", "A": "🏆 Aランク", "B": "🏆 Bランク", "C": "🏆 Cランク"}
+    tier_labels_map = {"S": "🏆 Sランク（上位）", "!": "❗ ！ランク（孤立・測定不能）", "A": "🏆 Aランク（中位）", "B": "🏆 Bランク（下位）", "C": "🏆 Cランク（圏外）"}
 
     if not valid_components:
         output.append("<p>比較可能な対戦データがありませんでした。</p>")
@@ -893,9 +747,7 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
                 G, runner_G, component, umaban_dict, target_course, target_distance, is_banei=is_banei
             )
 
-            if comp_idx == 0:
-                true_fastest = fastest
-
+            if comp_idx == 0: true_fastest = fastest
             all_ranked_scores.update(final_scores)
             all_tier_map.update(tier_map)
             all_ranked_horses.update(component)
@@ -910,20 +762,17 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
                 rank_groups[tier].append((horse, diff))
 
             output.append("<div class='ranking-list'>")
-
-            # 【重要修正】出力の順番を S -> ! -> A -> B -> C に変更
             display_order = ["S", "!", "A", "B", "C"]
             unranked_horses = [h for h in umaban_dict.keys() if h not in all_ranked_horses]
 
             for tier in display_order:
-                # 「！」ランク（孤立ノード）の差し込み処理
                 if tier == "!":
                     if comp_idx == 0 and unranked_horses:
                         color = tier_colors["!"]
                         output.append(f"<h3 style='color: white; background-color: {color}; padding: 6px 12px; border-radius: 5px; margin-top: 15px; margin-bottom: 8px; font-size: 0.9em;'>{tier_labels_map['!']}</h3>")
                         unranked_disp = [format_horse_name(h, umaban_dict, race_id) for h in unranked_horses]
                         output.append(f"<div style='background-color: #f5f0fa; border-left: 4px solid {color}; padding: 8px 12px; font-size: 0.85em; margin-bottom: 10px;'>")
-                        output.append(f"  <p style='margin: 0; color: #555;'>対戦繋がりがない別路線組。Sクラスの可能性もCクラスの可能性も秘めています。</p>")
+                        output.append(f"  <p style='margin: 0; color: #555;'>対戦繋がりがない別路線組。同競馬場実績がないため、Sクラスの可能性もCクラスの可能性も秘めています。</p>")
                         output.append(f"  <p style='margin: 8px 0 0 0; font-size: 0.9em;'>{'、'.join(unranked_disp)}</p>")
                         output.append("</div>")
                     continue
@@ -932,8 +781,7 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
                 if not horses_in_tier: continue
 
                 color = tier_colors.get(tier, "#333")
-                label = tier_labels_map.get(tier, f"🏆 {tier}ランク")
-                output.append(f"<h3 style='color: white; background-color: {color}; padding: 6px 12px; border-radius: 5px; margin-top: 15px; margin-bottom: 8px; font-size: 0.9em;'>{label}</h3>")
+                output.append(f"<h3 style='color: white; background-color: {color}; padding: 6px 12px; border-radius: 5px; margin-top: 15px; margin-bottom: 8px; font-size: 0.9em;'>{tier_labels_map[tier]}</h3>")
 
                 for horse, diff in horses_in_tier:
                     diff = max(0.0, diff)
@@ -946,47 +794,33 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
 
                     if horse == fastest:
                         output.append("    <p class='theory-text' style='margin:0;'>✨ <strong>この集団の最先着基準馬です。</strong></p>")
-
                         runners_except_1st = [h for h in component if h != fastest]
                         if runners_except_1st:
                             second_horse = min(runners_except_1st, key=lambda x: final_scores[x])
-                            second_disp = format_horse_name(second_horse, umaban_dict, race_id)
-
-                            output.append(f"    <p class='theory-text' style='margin:5px 0 3px 0; font-size:0.85em; color:#c0392b;'><strong>※次点評価の {second_disp} を上回る根拠：</strong></p>")
+                            output.append(f"    <p class='theory-text' style='margin:5px 0 3px 0; font-size:0.85em; color:#c0392b;'><strong>※次点評価の {format_horse_name(second_horse, umaban_dict, race_id)} を上回る根拠：</strong></p>")
                             runner_path = nx.shortest_path(runner_G, source=fastest, target=second_horse, weight='explore_cost')
-
-                            ability_summary = build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id, is_banei=is_banei)
-                            output.append(f"    <p class='theory-text' style='margin:0 0 5px 0;'>🔍 <strong>能力比較：</strong> {ability_summary}</p>")
+                            output.append(f"    <p class='theory-text' style='margin:0 0 5px 0;'>🔍 <strong>能力比較：</strong> {build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id, is_banei=is_banei)}</p>")
                             output.append("    <ul class='theory-details' style='margin: 0; padding-left: 20px; color: #555;'>")
                             output.extend(render_path_details(G, runner_path, runner_G, umaban_dict, target_course, target_distance, race_id, is_banei))
                             output.append("    </ul>")
                     else:
                         runner_path = nx.shortest_path(runner_G, source=fastest, target=horse, weight='explore_cost')
-
+                        display_runner_path = runner_path[-2:] if len(runner_path) > 2 else runner_path
                         if len(runner_path) > 2:
-                            display_runner_path = runner_path[-2:]
                             ref_horse = display_runner_path[0]
-                            ref_disp = format_horse_name(ref_horse, umaban_dict, race_id)
                             ref_diff = max(0.0, final_scores.get(ref_horse, 0))
-                            ref_tier = all_tier_map.get(ref_horse, get_rank_tier(ref_diff, is_banei=is_banei))
+                            ref_tier = all_tier_map.get(ref_horse, "C")
                             ref_diff_str = "±0.0" if ref_diff < diff_zero_th else f"+{ref_diff:.1f}"
-                            output.append(f"    <p class='theory-text' style='margin:0 0 3px 0; font-size:0.85em; color:#888;'>※ {ref_disp} ({ref_tier}ランク / {ref_diff_str}秒差) との比較：</p>")
-                        else:
-                            display_runner_path = runner_path
-
-                        ability_summary = build_ability_summary(G, display_runner_path, runner_G, umaban_dict, race_id, is_banei=is_banei)
-                        output.append(f"    <p class='theory-text' style='margin:0 0 5px 0;'>🔍 <strong>能力比較：</strong> {ability_summary}</p>")
+                            output.append(f"    <p class='theory-text' style='margin:0 0 3px 0; font-size:0.85em; color:#888;'>※ {format_horse_name(ref_horse, umaban_dict, race_id)} ({ref_tier}ランク / {ref_diff_str}秒差) との比較：</p>")
+                        
+                        output.append(f"    <p class='theory-text' style='margin:0 0 5px 0;'>🔍 <strong>能力比較：</strong> {build_ability_summary(G, display_runner_path, runner_G, umaban_dict, race_id, is_banei=is_banei)}</p>")
                         output.append("    <ul class='theory-details' style='margin: 0; padding-left: 20px; color: #555;'>")
                         output.extend(render_path_details(G, display_runner_path, runner_G, umaban_dict, target_course, target_distance, race_id, is_banei))
                         output.append("    </ul>")
-
                     output.append("  </div></div>")
-
             output.append("</div>")
 
-    # 外のループではunrankedを処理しないよう変更済み
     unranked = [h for h in umaban_dict.keys() if h not in all_ranked_horses]
-
     return "".join(output), all_ranked_scores, unranked, true_fastest, all_tier_map
 
 # ==========================================
@@ -999,38 +833,26 @@ def rank_horses(race_id, mark_race_id=None):
 
     is_banei = (target_track == "ばんえい")
 
-    G_course = build_measuring_stick_graph(past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=True)
-    result_course_html, _, _, _, _ = analyze_all_horses_html(G_course, umaban_dict, target_course, target_distance, html_race_id, is_banei=is_banei)
-
-    G_track = build_measuring_stick_graph(past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=False)
-    result_track_html, track_scores, track_unranked, track_fastest, track_tier_map = analyze_all_horses_html(G_track, umaban_dict, target_course, target_distance, html_race_id, is_banei=is_banei)
+    # 第1部・第2部を統合したOne-Graphを構築
+    G_unified = build_unified_graph(past_races, target_course, target_track, target_distance, umaban_dict)
+    result_html_content, track_scores, track_unranked, track_fastest, track_tier_map = analyze_all_horses_html(G_unified, umaban_dict, target_course, target_distance, html_race_id, is_banei=is_banei)
 
     ruler_ranks = {}
     for horse_name, diff in track_scores.items():
         diff = max(0.0, diff)
-        tier = track_tier_map.get(horse_name, get_rank_tier(diff, is_banei=is_banei))
-        if tier == "S" and horse_name == track_fastest:
-            score = RANK_SCORES["S+"]
-        else:
-            score = RANK_SCORES[tier]
-        ruler_ranks[horse_name] = {
-            "rank": tier,
-            "score": score,
-            "diff": round(diff, 2)
-        }
+        tier = track_tier_map.get(horse_name, "C")
+        score = RANK_SCORES["S+"] if tier == "S" and horse_name == track_fastest else RANK_SCORES.get(tier, 7)
+        ruler_ranks[horse_name] = {"rank": tier, "score": score, "diff": round(diff, 2)}
 
     for horse_name in track_unranked:
-        ruler_ranks[horse_name] = {
-            "rank": "!",
-            "score": RANK_SCORES["!"],
-            "diff": -1
-        }
+        ruler_ranks[horse_name] = {"rank": "!", "score": RANK_SCORES["!"], "diff": -1}
 
+    # 出力UIを統合版にスッキリと修正
     ruler_html = (
-        f"<h2 class='section-title' style='background-color: #7b8d7a; color: white; padding: 8px 10px; border-radius: 6px; font-size: 0.95em; margin: 10px 0 8px 0;'>【第1部】同コース（{target_course}）での比較</h2>"
-        f"{result_course_html}"
-        f"<h2 class='section-title' style='background-color: #7b8d7a; color: white; padding: 8px 10px; border-radius: 6px; font-size: 0.95em; margin: 20px 0 8px 0;'>【第2部】全国の競馬場（{target_track}）での比較<br><span style='font-size:0.75em; font-weight:normal;'>※適性(コース/距離)が近い過去レースを優先して算出。この結果が点数に反映されます。</span></h2>"
-        f"{result_track_html}"
+        f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
+        f"📊 全国の競馬場データから算出した能力序列<br>"
+        f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※同コース（{target_course} {target_distance}m）の対戦実績を最優先し、間接比較には0.7倍のノイズ割引を適用</span></h2>"
+        f"{result_html_content}"
     )
 
     return ruler_ranks, ruler_html
@@ -1058,8 +880,7 @@ def analyze():
         base_prefix = base_race_id[:10]
         for r in selected_races:
             rid = base_prefix + str(int(r)).zfill(2)
-            if rid != base_race_id:
-                race_ids.append(rid)
+            if rid != base_race_id: race_ids.append(rid)
         race_ids = sorted(set(race_ids), key=lambda x: int(x[-2:]))
 
     race_list = [{'race_id': rid, 'race_num': int(rid[-2:])} for rid in race_ids]
@@ -1079,30 +900,21 @@ def analyze_single():
 
         is_banei = (target_track == "ばんえい")
 
-        G_course = build_measuring_stick_graph(past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=True)
-        result_course, _, _, _, _ = analyze_all_horses_html(G_course, umaban_dict, target_course, target_distance, is_banei=is_banei)
+        G_unified = build_unified_graph(past_races, target_course, target_track, target_distance, umaban_dict)
+        result_html_content, _, _, _, _ = analyze_all_horses_html(G_unified, umaban_dict, target_course, target_distance, is_banei=is_banei)
 
         water_note = ""
         if is_banei and water_mode:
             label = "1.9%以下（軽馬場）" if water_mode == 'dry' else "2.0%以上（重馬場）"
             water_note = f"<p style='text-align:center; color:#2980b9; font-size:13px; margin-bottom:15px;'>💧 水分量フィルタ: <strong>{label}</strong> のレースのみ使用</p>"
 
-        if is_banei:
-            result_html = (
-                f"{water_note}"
-                f"<h2 class='section-title' style='background-color: #7b8d7a; color: white; padding: 8px 10px; border-radius: 6px; font-size: 0.95em; margin: 10px 0 8px 0;'>帯広ばんえい {target_distance}m での比較</h2>"
-                f"{result_course}"
-            )
-        else:
-            G_track = build_measuring_stick_graph(past_races, target_course, target_track, target_distance, umaban_dict, is_course_only=False)
-            result_track, _, _, _, _ = analyze_all_horses_html(G_track, umaban_dict, target_course, target_distance, is_banei=False)
-
-            result_html = (
-                f"<h2 class='section-title' style='background-color: #7b8d7a; color: white; padding: 8px 10px; border-radius: 6px; font-size: 0.95em; margin: 10px 0 8px 0;'>【第1部】同コース（{target_course}）での比較</h2>"
-                f"{result_course}"
-                f"<h2 class='section-title' style='background-color: #7b8d7a; color: white; padding: 8px 10px; border-radius: 6px; font-size: 0.95em; margin: 20px 0 8px 0;'>【第2部】全国の競馬場（{target_track}）での比較<br><span style='font-size:0.75em; font-weight:normal;'>※適性(コース/距離)が近い過去レースを優先して算出</span></h2>"
-                f"{result_track}"
-            )
+        result_html = (
+            f"{water_note}"
+            f"<h2 class='section-title' style='background-color: #2c3e50; color: white; padding: 10px 12px; border-radius: 6px; font-size: 1.05em; margin: 15px 0 10px 0;'>"
+            f"📊 全国のデータから算出した能力序列<br>"
+            f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※同コース（{target_course} {target_distance}m）の対戦実績を絶対視し、間接比較には0.7倍の割引を適用</span></h2>"
+            f"{result_html_content}"
+        )
         return jsonify({'title': race_title, 'html': result_html})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
