@@ -11,7 +11,7 @@ app = Flask(__name__)
 # ==========================================
 # 点数配分
 # ==========================================
-RANK_SCORES = {"S+": 35, "S": 30, "A": 20, "B": 10, "C": 7, "!": 27}
+RANK_SCORES = {"S+": 35, "S": 30, "!": 27, "A": 20, "B": 10, "C": 7}
 
 # ==========================================
 # 1. Netkeiba ディープスクレイパー
@@ -388,34 +388,22 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
         if not is_distance_in_range(race['distance'], target_distance): continue
 
         is_banei = race.get('is_banei', False)
-        is_nar_race = race['course'] in ('門別', '盛岡', '水沢', '浦和', '船橋', '大井', '川崎', '金沢', '笠松', '名古屋', '園田', '姫路', '高知', '佐賀')
-
-        if is_nar_race:
-            try:
-                dist_diff = abs(int(race['distance']) - int(target_distance))
-            except (ValueError, TypeError):
-                dist_diff = 9999
-            if dist_diff == 0:
-                base_cost = 1 if race['course'] == target_course else 2
-            elif dist_diff <= 100:
-                base_cost = 5 if race['course'] == target_course else 8
-            elif dist_diff <= 200:
-                base_cost = 10 if race['course'] == target_course else 15
-            else:
-                base_cost = 20 if race['course'] == target_course else 30
+        
+        # 探索優先度コスト設定（①・②・③の重み付け）
+        is_same_course = (race['course'] == target_course)
+        try:
+            dist_diff = abs(int(race['distance']) - int(target_distance))
+        except (ValueError, TypeError):
+            dist_diff = 9999
+            
+        if is_same_course and dist_diff == 0:
+            base_cost = 1  # ①同場・同距離（最優先）
+        elif is_same_course and dist_diff <= 200:
+            base_cost = 5  # ②近距離・同場
+        elif not is_same_course and dist_diff == 0:
+            base_cost = 8  # ②同距離・別場
         else:
-            try:
-                dist_diff = abs(int(race['distance']) - int(target_distance))
-            except (ValueError, TypeError):
-                dist_diff = 9999
-            if dist_diff == 0:
-                base_cost = 1 if race['course'] == target_course else 2
-            elif dist_diff <= 100:
-                base_cost = 5 if race['course'] == target_course else 8
-            elif dist_diff <= 200:
-                base_cost = 10 if race['course'] == target_course else 15
-            else:
-                base_cost = 20 if race['course'] == target_course else 30
+            base_cost = 20 # ③その他
 
         cap_val = 30.0 if is_banei else 10.0
 
@@ -431,25 +419,30 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
 
                 h1_is_current = h1_name in umaban_dict
                 h2_is_current = h2_name in umaban_dict
-                if not h1_is_current and not h2_is_current:
+                is_direct = (h1_is_current and h2_is_current)
+
+                if not is_direct:
                     has_current_in_race = any(h in umaban_dict for h, _ in filtered_horses)
                     if not has_current_in_race:
                         continue
-
+                        
                 if h1_name > h2_name:
                     h1_name, h1_time, h2_name, h2_time = h2_name, h2_time, h1_name, h1_time
 
                 raw_diff = h1_time - h2_time
 
-                if not is_banei and abs(raw_diff) >= 2.0:
-                    continue
+                # 【重要修正】隠れ馬（物差し馬）の場合は、着差2秒以上（ばんえいは15秒以上）は使わない
+                if not is_direct:
+                    if is_banei and abs(raw_diff) >= 30.0:
+                        continue
+                    elif not is_banei and abs(raw_diff) >= 2.0:
+                        continue
 
                 if raw_diff < 0:
                     capped_diff = max(-cap_val, raw_diff)
                 else:
                     capped_diff = min(cap_val, raw_diff)
 
-                is_direct = (h1_is_current and h2_is_current)
                 worse_time = max(h1_time, h2_time)
                 
                 if is_banei:
@@ -464,7 +457,7 @@ def build_measuring_stick_graph(past_races, target_course, target_track, target_
                 if is_direct:
                     edge_cost = base_cost + reliability_penalty
                 else:
-                    edge_cost = base_cost + 100 + reliability_penalty
+                    edge_cost = base_cost + 100 + reliability_penalty # 隠れ馬経由にはペナルティ大
 
                 h1_past_umaban = race.get('past_umaban', {}).get(h1_name, "")
                 h2_past_umaban = race.get('past_umaban', {}).get(h2_name, "")
@@ -546,22 +539,21 @@ def format_horse_name(horse, umaban_dict, race_id=None):
         return f"[隠] {horse}"
 
 def get_rank_tier(diff, is_banei=False):
-    """絶対diff閾値によるランク判定（ストイック版・参照用）"""
+    """Fallback Tier assignment (used only for missing/isolated mapping)"""
     r_diff = round(diff, 1)
     if is_banei:
-        if r_diff <= 5.0: return "S"
-        elif r_diff <= 10.0: return "A"
-        elif r_diff <= 18.0: return "B"
+        if r_diff <= 3.0: return "S"
+        elif r_diff <= 8.0: return "A"
+        elif r_diff <= 15.0: return "B"
         else: return "C"
     else:
-        if r_diff <= 0.3: return "S"
+        if r_diff <= 0.2: return "S"
         elif r_diff <= 0.7: return "A"
-        elif r_diff <= 1.2: return "B"
+        elif r_diff <= 1.5: return "B"
         else: return "C"
 
 # 複数ルート（クロスチェック）を加味してタイムを平均化する処理
 def calc_path_score(G, path, target_course=None, target_distance=None):
-    """パス上のタイム差を合算。同距離同競馬場のデータは重み2倍で反映。"""
     score = 0.0
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
@@ -596,16 +588,15 @@ def calc_path_score(G, path, target_course=None, target_distance=None):
             else:
                 score += edge['rank_diff']
                 
-    # === 修正ポイント：隠れ馬（複数エッジ）経由の比較はノイズを減らすため0.7倍に割引 ===
+    # 【重要修正】隠れ馬（複数エッジ）経由の比較はノイズを減らすため0.7倍に割引
     if len(path) > 2:
         score *= 0.7
         
     return score
 
-# 複数ルートでの表現を可能にするUIビルダ
 def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, is_banei=False):
     parts = []
-    is_hidden_comparison = len(runner_path) > 2  # 隠れ馬経由か判定
+    is_hidden_comparison = len(runner_path) > 2
     
     for k in range(len(runner_path) - 1):
         u, v = runner_path[k], runner_path[k+1]
@@ -646,7 +637,6 @@ def build_ability_summary(G, runner_path, runner_G, umaban_dict, race_id=None, i
             
     return "".join(parts)
 
-# 複数ルートの詳細をリストで表示するUIビルダ
 def render_path_details(G, runner_path, runner_G, umaban_dict, target_course, target_distance, race_id=None, is_banei=False):
     details = []
     for k in range(len(runner_path) - 1):
@@ -752,7 +742,6 @@ def _render_single_path_details(G, path, umaban_dict, target_course, target_dist
             else:
                 details.append(f"      <li{li_style}>{link} 等で <strong>{w_disp}</strong> ＞＞＞ {l_disp} {record_str}</li>")
                 
-    # === 修正ポイント：隠れ馬経由の場合、最後に注意書きを追加 ===
     if len(path) > 2:
         details.append(f"      <li{li_style}><span style='color:#9b59b6; font-size:0.85em; font-weight:bold;'>※上記合計タイム差に対して、隠れ馬ノイズ割引（×0.7）が適用されています。</span></li>")
                 
@@ -854,96 +843,27 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
 
     ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
 
-    # === 新ロジック: 「＞」「＞＞」基準でのティア割り当て（トポロジカル・ソート） ===
-    matchup_matrix = {u: {} for u in current_runners}
-    near_th = 7.0 if is_banei else 0.5
-    far_th = 13.0 if is_banei else 0.9
-    close_th = 3.0 if is_banei else 0.2
-
-    for u in current_runners:
-        for v in current_runners:
-            if u == v:
-                continue
-            
-            s_uv = pair_scores[u].get(v, float('inf'))
-            if s_uv == float('inf'):
-                matchup_matrix[u][v] = "="
-                continue
-                
-            adv = -s_uv
-            
-            if adv >= far_th:
-                matchup_matrix[u][v] = ">>"
-            elif adv >= near_th:
-                matchup_matrix[u][v] = ">"
-            elif adv <= -far_th:
-                matchup_matrix[u][v] = "<<"
-            elif adv <= -near_th:
-                matchup_matrix[u][v] = "<"
-            else:
-                matchup_matrix[u][v] = "="
-
+    # === 【重要修正】Sを基準とした厳格なA/B/C序列化（トップからの0.7倍加味タイム差で決定） ===
     tier_map = {}
-    pool = set(current_runners)
-    tier_labels = ["S", "A", "B"]
-    
-    for tier_name in tier_labels:
-        if not pool:
-            break
+    for h, score in final_scores.items():
+        if score == float('inf'):
+            tier_map[h] = "C"
+            continue
             
-        metrics = {}
-        for h in pool:
-            l_score = 0
-            w_score = 0
-            for opp in pool:
-                if opp == h:
-                    continue
-                rel = matchup_matrix[h].get(opp, "=")
-                
-                s_hopp = pair_scores[h].get(opp, float('inf'))
-                adv = -s_hopp if s_hopp != float('inf') else 0.0
-                
-                if rel == "<<": l_score += 2
-                elif rel == "<": l_score += 1
-                elif rel == ">>": w_score += 10
-                elif rel == ">": w_score += 5
-                elif rel == "=":
-                    if adv >= close_th: w_score += 1
-                    elif adv <= -close_th: l_score += 1
-                    
-            metrics[h] = (l_score, -w_score)
-            
-        best_metric = min(metrics.values())
-        current_tier_horses = {h for h, m in metrics.items() if m == best_metric}
-        
-        for h in current_tier_horses:
-            tier_map[h] = tier_name
-            
-        pool -= current_tier_horses
-        
-    for h in pool:
-        tier_map[h] = "C"
-
-    _tier_rank = {"S": 0, "A": 1, "B": 2, "C": 3}
-    for u in current_runners:
-        for v in current_runners:
-            if u == v:
-                continue
-            if G.has_edge(u, v) or G.has_edge(v, u):
-                a, b = (u, v) if u < v else (v, u)
-                if G.has_edge(a, b):
-                    edge = G[a][b]
-                    same_cond_diffs = [h['raw_diff'] for h in edge['history']
-                                       if h['course'] == target_course and h['distance'] == target_distance]
-                    if same_cond_diffs:
-                        avg_sc = sum(same_cond_diffs) / len(same_cond_diffs)
-                        winner, loser = (a, b) if avg_sc < 0 else (b, a)
-                        th = 5.0 if is_banei else 0.5
-                        if abs(avg_sc) >= th:
-                            w_t = _tier_rank.get(tier_map.get(winner, "C"), 3)
-                            l_t = _tier_rank.get(tier_map.get(loser, "C"), 3)
-                            if w_t > l_t:
-                                tier_map[winner] = tier_map[loser]
+        diff = max(0.0, score - final_scores[fastest])
+        if h == fastest:
+            tier_map[h] = "S"
+        else:
+            if is_banei:
+                if diff <= 3.0: tier_map[h] = "S"
+                elif diff <= 8.0: tier_map[h] = "A"
+                elif diff <= 15.0: tier_map[h] = "B"
+                else: tier_map[h] = "C"
+            else:
+                if diff <= 0.2: tier_map[h] = "S"
+                elif diff <= 0.7: tier_map[h] = "A"
+                elif diff <= 1.5: tier_map[h] = "B"
+                else: tier_map[h] = "C"
 
     return fastest, final_scores, ranked_list, tier_map
 
@@ -963,7 +883,7 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
     diff_zero_th = 0.5 if is_banei else 0.05
     unit_label = "秒差換算"
     tier_colors = {"S": "#e74c3c", "!": "#9b59b6", "A": "#e67e22", "B": "#f1c40f", "C": "#3498db"}
-    tier_labels_map = {"S": "🏆 Sランク", "!": "❗ 測定不能", "A": "🏆 Aランク", "B": "🏆 Bランク", "C": "🏆 Cランク"}
+    tier_labels_map = {"S": "🏆 Sランク", "!": "❗ ！ランク（測定不能）", "A": "🏆 Aランク", "B": "🏆 Bランク", "C": "🏆 Cランク"}
 
     if not valid_components:
         output.append("<p>比較可能な対戦データがありませんでした。</p>")
@@ -991,8 +911,24 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
 
             output.append("<div class='ranking-list'>")
 
-            for tier in ["S", "A", "B", "C"]:
-                horses_in_tier = rank_groups[tier]
+            # 【重要修正】出力の順番を S -> ! -> A -> B -> C に変更
+            display_order = ["S", "!", "A", "B", "C"]
+            unranked_horses = [h for h in umaban_dict.keys() if h not in all_ranked_horses]
+
+            for tier in display_order:
+                # 「！」ランク（孤立ノード）の差し込み処理
+                if tier == "!":
+                    if comp_idx == 0 and unranked_horses:
+                        color = tier_colors["!"]
+                        output.append(f"<h3 style='color: white; background-color: {color}; padding: 6px 12px; border-radius: 5px; margin-top: 15px; margin-bottom: 8px; font-size: 0.9em;'>{tier_labels_map['!']}</h3>")
+                        unranked_disp = [format_horse_name(h, umaban_dict, race_id) for h in unranked_horses]
+                        output.append(f"<div style='background-color: #f5f0fa; border-left: 4px solid {color}; padding: 8px 12px; font-size: 0.85em; margin-bottom: 10px;'>")
+                        output.append(f"  <p style='margin: 0; color: #555;'>対戦繋がりがない別路線組。Sクラスの可能性もCクラスの可能性も秘めています。</p>")
+                        output.append(f"  <p style='margin: 8px 0 0 0; font-size: 0.9em;'>{'、'.join(unranked_disp)}</p>")
+                        output.append("</div>")
+                    continue
+
+                horses_in_tier = rank_groups.get(tier, [])
                 if not horses_in_tier: continue
 
                 color = tier_colors.get(tier, "#333")
@@ -1046,76 +982,10 @@ def analyze_all_horses_html(G, umaban_dict, target_course, target_distance, race
 
                     output.append("  </div></div>")
 
-                if tier == "S":
-                    s_horses = [h for h, d in rank_groups["S"]]
-                    target_horses = s_horses if len(s_horses) >= 2 else s_horses + [h for h, d in rank_groups["A"]]
-                    
-                    all_race_info = {}
-                    for u, v, data in undirected_G.edges(data=True):
-                        for hist in data.get('history', []):
-                            rid = hist['race_id']
-                            if rid not in all_race_info:
-                                all_race_info[rid] = {
-                                    'date': hist['date'],
-                                    'course': hist['course'],
-                                    'distance': hist['distance'],
-                                    'horses': {}
-                                }
-                            h1_n = hist.get('h1_name')
-                            h2_n = hist.get('h2_name')
-                            if h1_n and h1_n in umaban_dict:
-                                all_race_info[rid]['horses'][h1_n] = {'time': hist['h1_time'], 'umaban': hist['h1_past_umaban']}
-                            if h2_n and h2_n in umaban_dict:
-                                all_race_info[rid]['horses'][h2_n] = {'time': hist['h2_time'], 'umaban': hist['h2_past_umaban']}
-                    
-                    attention_races = {}
-                    for i in range(len(target_horses)):
-                        for j in range(i+1, len(target_horses)):
-                            h1 = target_horses[i]
-                            h2 = target_horses[j]
-                            if undirected_G.has_edge(h1, h2):
-                                for hist in undirected_G[h1][h2]['history']:
-                                    if abs(hist['raw_diff']) <= (10.0 if is_banei else 0.8):
-                                        rid = hist['race_id']
-                                        if rid not in attention_races:
-                                            attention_races[rid] = all_race_info[rid]
-                    
-                    if attention_races:
-                        output.append("<div class='attention-races' style='background-color: #fff9e6; border: 1px solid #f1c40f; padding: 12px; margin-top: 15px; margin-bottom: 25px; border-radius: 6px;'>")
-                        output.append("<h4 style='margin: 0 0 8px 0; color: #d35400; font-size: 0.95em;'>🔍 上位馬の直接対決（タイム僅差の注目レース）</h4>")
-                        
-                        sorted_races = sorted(attention_races.items(), key=lambda x: x[1]['date'], reverse=True)
-                        for rid, rdata in sorted_races:
-                            url = f"https://db.netkeiba.com/race/{rid}"
-                            race_name = f"{rdata['date']} {rdata['course']} {rdata['distance']}m"
-                            output.append(f"<div style='margin-bottom: 12px; font-size: 0.9em; background: #fff; padding: 8px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>")
-                            output.append(f"  <div style='margin-bottom: 5px;'><a href='{url}' target='_blank' style='color: #2980b9; font-weight: bold; text-decoration: underline;'>▶ {race_name} の結果・映像へ</a></div>")
-                            output.append("  <ul style='margin: 0; padding-left: 20px; color: #333;'>")
-                            
-                            sorted_h = sorted(rdata['horses'].items(), key=lambda x: x[1]['time'])
-                            best_time = sorted_h[0][1]['time']
-                            for h, hdata in sorted_h:
-                                curr_umaban = umaban_dict.get(h, "?")
-                                past_uma = hdata['umaban']
-                                if not past_uma: past_uma = "?"
-                                diff_to_best = hdata['time'] - best_time
-                                diff_str = f"+{diff_to_best:.1f}秒" if diff_to_best > 0 else "最先着"
-                                output.append(f"<li style='margin-bottom: 2px;'>[今回: <strong>{curr_umaban}</strong>番] {h} <span style='color: #7f8c8d; font-size: 0.85em;'>(当時の馬番: <strong style='color: #c0392b;'>{past_uma}</strong>番)</span> <span style='color: #e74c3c; font-weight: bold; margin-left: 5px;'>{diff_str}</span></li>")
-                            output.append("  </ul>")
-                            output.append("</div>")
-                        output.append("</div>")
-
             output.append("</div>")
 
+    # 外のループではunrankedを処理しないよう変更済み
     unranked = [h for h in umaban_dict.keys() if h not in all_ranked_horses]
-    if unranked:
-        color = tier_colors["!"]
-        output.append(f"<h3 style='color: white; background-color: {color}; padding: 6px 12px; border-radius: 5px; margin-top: 15px; margin-bottom: 8px; font-size: 0.9em;'>{tier_labels_map['!']}</h3>")
-        unranked_disp = [format_horse_name(h, umaban_dict, race_id) for h in unranked]
-        output.append(f"<div style='background-color: #f5f0fa; border-left: 4px solid {color}; padding: 8px 12px; font-size: 0.85em; margin-bottom: 10px;'>")
-        output.append(f"  <p style='margin: 0; color: #555;'>対戦繋がりがない別路線組</p>")
-        output.append(f"  <p style='margin: 8px 0 0 0; font-size: 0.9em;'>{'、'.join(unranked_disp)}</p>")
-        output.append("</div>")
 
     return "".join(output), all_ranked_scores, unranked, true_fastest, all_tier_map
 
