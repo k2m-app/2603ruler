@@ -24,15 +24,10 @@ PAGE_STYLE = """
   .rank-title { font-size: 15px; margin: 0 0 5px 0; color: #2c3e50; }
   .time-diff { color: #e74c3c; font-weight: bold; }
   .theory-box { background-color: #f8f9fa; border-left: 4px solid #7b8d7a; padding: 10px 12px;
-                border-radius: 0 6px 6px 0; font-size: 13px; }
-  .theory-text { margin: 0 0 6px 0; color: #444; }
-  .theory-details { margin: 0; padding-left: 18px; color: #555; }
-  .theory-details li { margin-bottom: 4px; line-height: 1.4; }
+                border-radius: 0 6px 6px 0; font-size: 13px; line-height: 1.6; }
   .race-link { color: #3498db; text-decoration: none; font-weight: bold; }
   .race-link:hover { color: #2980b9; text-decoration: underline; }
   .ranking-list { margin-bottom: 10px; }
-  .attention-races { background-color: #fff9e6; border: 1px solid #f1c40f; padding: 10px;
-                     margin-top: 12px; margin-bottom: 20px; border-radius: 6px; }
 </style>
 """
 
@@ -48,7 +43,6 @@ def wrap_html(content_html: str) -> str:
   {content_html}
 </body>
 </html>"""
-
 
 def run_analysis(race_id: str, water_mode: str | None = None):
     scraper = NetkeibaScraper()
@@ -79,13 +73,12 @@ def run_analysis(race_id: str, water_mode: str | None = None):
 
     return race_title, result_html
 
-
 # ==========================================
 # Streamlit UI
 # ==========================================
 st.set_page_config(page_title="競馬物差しツール", page_icon="🏇", layout="centered")
 st.title("🏇 競馬物差しツール")
-st.caption("netkeiba のレースURLを入力すると、出走馬の能力を物差し馬経由で比較します。")
+st.caption("netkeiba のレースURLを入力すると、全出走馬の総当たり比較（拡張馬柱）を生成します。")
 
 with st.form("race_form"):
     url_input = st.text_input(
@@ -98,7 +91,6 @@ with st.form("race_form"):
         race_nums = st.text_input(
             "複数レース（任意）",
             placeholder="例: 1,3,5,11",
-            help="同日の複数レースをまとめて分析する場合は、レース番号をカンマ区切りで入力",
         )
     with col2:
         water_mode = st.selectbox(
@@ -106,7 +98,7 @@ with st.form("race_form"):
             options=["なし", "軽馬場（dry）", "重馬場（wet）"],
         )
 
-    submitted = st.form_submit_button("分析開始", type="primary", use_container_width=True)
+    submitted = st.form_submit_button("全頭比較を開始", type="primary", use_container_width=True)
 
 if submitted:
     scraper = NetkeibaScraper()
@@ -133,7 +125,7 @@ if submitted:
         wmode = "wet"
 
     if len(race_ids) == 1:
-        with st.spinner("分析中..."):
+        with st.spinner("出走馬の全頭総当たり比較を計算中..."):
             try:
                 race_title, result_html = run_analysis(race_ids[0], wmode)
                 st.subheader(race_title)
@@ -145,7 +137,7 @@ if submitted:
         tabs = st.tabs([f"{int(rid[-2:])}R" for rid in race_ids])
         for tab, rid in zip(tabs, race_ids):
             with tab:
-                with st.spinner(f"{int(rid[-2:])}R を分析中..."):
+                with st.spinner(f"{int(rid[-2:])}R を計算中..."):
                     try:
                         race_title, result_html = run_analysis(rid, wmode)
                         st.subheader(race_title)
