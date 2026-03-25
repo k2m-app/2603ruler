@@ -482,7 +482,6 @@ def calc_path_score(G, path, target_course=None, target_distance=None):
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
         
-        # 【修正】生データ（G）に確実にエッジが存在するかチェック
         if G.has_edge(u, v):
             edge = G[u][v]
             sign = 1
@@ -571,7 +570,6 @@ def _render_single_path_details(G, path, umaban_dict, target_course, target_dist
     for k in range(len(path) - 1):
         u, v = path[k], path[k+1]
         
-        # 【修正】生データ（G）にエッジが存在するか厳格チェック
         if G.has_edge(u, v):
             edge = G[u][v]
             h1, h2 = u, v
@@ -659,7 +657,8 @@ def build_runner_graph(undirected_G, umaban_dict, is_banei=False):
 
 def _rank_component(G, runner_G, component, umaban_dict, target_course, target_distance, is_banei=False):
     current_runners = list(component)
-    decisive_th = 4.0 if is_banei else 0.4 
+    # 勝敗を分ける閾値（これ以上のタイム差をつけられたら「明確な負け」とする）
+    loss_th = 3.0 if is_banei else 0.2
 
     adv_matrix = {u: {v: 0.0 for v in current_runners} for u in current_runners}
 
@@ -671,7 +670,6 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                 score = 0.0
                 has_target_cond = False
 
-                # 【大修正】KeyError防止：経路が直接つながっているか、生のGグラフを厳密にチェック
                 if len(path) == 2 and (G.has_edge(u, v) or G.has_edge(v, u)):
                     edge = G[u][v] if G.has_edge(u, v) else G[v][u]
                     same_cond_diffs = [h['raw_diff'] for h in edge['history'] if h['course'] == target_course and h['distance'] == target_distance]
@@ -680,7 +678,6 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
                         score = avg_diff if G.has_edge(u, v) else -avg_diff
                         has_target_cond = True
 
-                # 【大修正】KeyError防止：複数ホップ（迂回ルート）の場合は、ホップごとに区切ってスコアを加算する
                 if not has_target_cond:
                     total_score = 0.0
                     for k in range(len(path) - 1):
@@ -694,6 +691,9 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
             except nx.NetworkXNoPath:
                 adv_matrix[u][v] = float('inf')
 
+    # ==================================================
+    # 👑 新ロジック：勝ち残りトーナメント（トポロジカル・ソート）
+    # ==================================================
     pool = set(current_runners)
     tier_map = {}
     
@@ -704,12 +704,16 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
             has_loss = False
             for opp in pool:
                 if h == opp: continue
-                if adv_matrix[h][opp] > decisive_th:
+                # h が opp より明確に遅い（閾値以上のタイム差をつけられている）場合、hは「負け」
+                if adv_matrix[h][opp] != float('inf') and adv_matrix[h][opp] > loss_th:
                     has_loss = True
                     break
+            
+            # 誰にも負けていない馬が、この階層のトップ（無敗馬）になる
             if not has_loss:
                 candidates.append(h)
                 
+        # 三すくみ（A>B>C>A）などで全員に負けがついてしまった場合のセーフティネット
         if not candidates:
             best_h = min(pool, key=lambda h: sum(adv_matrix[h][o] for o in pool if adv_matrix[h][o] != float('inf')))
             candidates = [best_h]
@@ -721,7 +725,10 @@ def _rank_component(G, runner_G, component, umaban_dict, target_course, target_d
     for h in pool:
         tier_map[h] = "C"
 
-    fastest = min(current_runners, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
+    # 集団のリーダー（UI表示用の基準馬）は、Sランクの中から一番タイム差が優秀な馬を選ぶ
+    s_tier_horses = [h for h, t in tier_map.items() if t == "S"]
+    if not s_tier_horses: s_tier_horses = current_runners
+    fastest = min(s_tier_horses, key=lambda h: sum(adv_matrix[h][o] for o in current_runners if adv_matrix[h][o] != float('inf')))
     
     final_scores = {h: adv_matrix[h][fastest] if adv_matrix[h][fastest] != float('inf') else float('inf') for h in current_runners}
     ranked_list = sorted([(h, s) for h, s in final_scores.items() if s != float('inf')], key=lambda x: (x[1], 0 if x[0] == fastest else 1))
