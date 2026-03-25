@@ -8,12 +8,12 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from app import (
     NetkeibaScraper,
-    build_unified_graph,        # ← ここを変更！
+    build_unified_graph,
     analyze_all_horses_html,
 )
 
 # ==========================================
-# CSS（result.htmlのスタイルを流用）
+# CSS
 # ==========================================
 PAGE_STYLE = """
 <style>
@@ -37,7 +37,6 @@ PAGE_STYLE = """
 """
 
 def wrap_html(content_html: str) -> str:
-    """分析結果HTMLを完全なHTMLページとしてラップ"""
     return f"""<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -58,12 +57,10 @@ def run_analysis(race_id: str, water_mode: str | None = None):
 
     is_banei = (target_track == "ばんえい")
 
-    # 第1部・第2部を分けるのをやめ、統合グラフを1つだけ作る
     G_unified = build_unified_graph(
         past_races, target_course, target_track, target_distance, umaban_dict
     )
     
-    # 解析処理を実行
     result_html_content, _, _, _, _ = analyze_all_horses_html(
         G_unified, umaban_dict, target_course, target_distance, race_id=None, is_banei=is_banei
     )
@@ -73,7 +70,6 @@ def run_analysis(race_id: str, water_mode: str | None = None):
         label = "1.9%以下（軽馬場）" if water_mode == "dry" else "2.0%以上（重馬場）"
         water_note = f"<p style='color:#2980b9; font-size:13px;'>💧 水分量フィルタ: <strong>{label}</strong></p>"
         
-    # 第2部表記を削り、統合版の1つのヘッダーで出力する
     result_html = (
         f"{water_note}"
         f"<h2 class='section-title'>📊 {target_course} {target_distance}m 基準：能力序列<br>"
@@ -120,7 +116,6 @@ if submitted:
         st.error("正しいnetkeibaのURLを入力してください（12桁のrace_idが含まれるもの）")
         st.stop()
 
-    # レースIDリスト構築
     race_ids = [base_race_id]
     if race_nums.strip():
         base_prefix = base_race_id[:10]
@@ -137,7 +132,6 @@ if submitted:
     elif water_mode == "重馬場（wet）":
         wmode = "wet"
 
-    # 複数レースはタブ表示
     if len(race_ids) == 1:
         with st.spinner("分析中..."):
             try:
