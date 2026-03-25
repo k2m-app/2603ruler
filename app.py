@@ -34,7 +34,6 @@ def _is_one_turn(place, dist):
     if place == "浦和" and d == 800: return True
     if place == "船橋" and d in [1000, 1200]: return True
     if place == "大井" and d in [1000, 1200, 1400]: return True
-    # JRAの代表的な1ターン（芝ダート問わず短距離〜マイル）
     if place == "東京" and d <= 1800: return True
     if place == "新潟" and d <= 1800: return True
     if place == "中京" and d <= 1600: return True
@@ -42,8 +41,17 @@ def _is_one_turn(place, dist):
     if place == "京都" and d in [1200, 1400, 1600, 1800]: return True
     return False
 
+def get_track_group(place):
+    """相互乗り入れする地方競馬場を「同じ場所」としてグループ化"""
+    groups = {
+        "姫路": "兵庫", "園田": "兵庫",
+        "盛岡": "岩手", "水沢": "岩手",
+        "笠松": "東海", "名古屋": "東海"
+    }
+    return groups.get(place, place)
+
 def _is_same_track_layout(place, dist1, dist2):
-    """競馬場と距離から、コース形態が一致するか判定。南関以外は距離差で許容"""
+    """競馬場と距離から、コース形態が一致するか判定"""
     d1 = int(dist1) if str(dist1).isdigit() else 0
     d2 = int(dist2) if str(dist2).isdigit() else 0
     
@@ -72,8 +80,14 @@ def _is_same_track_layout(place, dist1, dist2):
             return "multi_turn"
         return get_urawa_layout(d1) == get_urawa_layout(d2)
     
-    # 南関以外（JRAや他地方）は、距離の差が200m以内なら同形態とみなす
-    return abs(d1 - d2) <= 200
+    JRA_PLACES = ["札幌", "函館", "福島", "新潟", "東京", "中山", "中京", "京都", "阪神", "小倉"]
+    if place in JRA_PLACES:
+        return abs(d1 - d2) <= 200  # JRAは200mの差を許容
+    elif place == "帯広":
+        return True  # ばんえいは基本200mなので距離比較不要
+    else:
+        # 南関・JRA以外の地方競馬は「同距離至上主義」（完全一致のみ許容）
+        return d1 == d2
 
 def get_short_course_name(course, dist):
     if not course: return "?"
@@ -84,7 +98,8 @@ def get_short_course_name(course, dist):
 
 def calculate_time_decay(race_date_str):
     """鮮度の評価：古いレースほど価値（ポイント）を割り引く"""
-    if not race_date_str or race_date_str == "不明": return 0.5
+    # 日付が取得できなかった場合は、不当に評価を下げないよう1.0倍を返す
+    if not race_date_str or race_date_str == "不明": return 1.0 
     try:
         parts = race_date_str.split('/')
         if len(parts) == 3:
@@ -92,13 +107,13 @@ def calculate_time_decay(race_date_str):
             yy = yy + 2000 if yy < 100 else yy
             r_date = datetime(yy, int(parts[1]), int(parts[2]))
             days = (datetime.now() - r_date).days
-            if days <= 60: return 1.0       # 2ヶ月以内: そのまま
-            elif days <= 120: return 0.8    # 4ヶ月以内: 80%
-            elif days <= 180: return 0.6    # 半年以内: 60%
-            else: return 0.4                # 半年以上昔: 40%
+            if days <= 60: return 1.0       
+            elif days <= 120: return 0.8    
+            elif days <= 180: return 0.6    
+            else: return 0.4                
     except:
         pass
-    return 0.5
+    return 1.0
 
 # ==========================================
 # 1. Netkeiba ディープスクレイパー
@@ -197,13 +212,15 @@ class NetkeibaScraper:
                     course_match = re.search(r'(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉|門別|盛岡|水沢|浦和|船橋|大井|川崎|金沢|笠松|名古屋|園田|姫路|高知|佐賀|帯広)', data01.text)
                     course = course_match.group(1) if course_match else "不明"
 
-                    date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', data01.text)
+                    # 地方の2桁年や / 表記にも対応
+                    date_match = re.search(r'(\d{2,4})[./年](\d{1,2})[./月](\d{1,2})', data01.text)
                     race_date = "不明"
                     if date_match:
-                        yy = date_match.group(1)[2:]
+                        yy = int(date_match.group(1))
+                        if yy < 100: yy += 2000
                         mm = int(date_match.group(2))
                         dd = int(date_match.group(3))
-                        race_date = f"20{yy}/{mm:02d}/{dd:02d}"
+                        race_date = f"{yy}/{mm:02d}/{dd:02d}"
 
                     data05 = td.find('div', class_='Data05')
                     if data05:
@@ -255,7 +272,6 @@ class NetkeibaScraper:
                         elif ref_horse_name not in past_races_dict[past_race_id]['horses']:
                             past_races_dict[past_race_id]['horses'][ref_horse_name] = ref_time_behind
 
-                    # 深掘り対象の選定
                     limit = 5 if is_banei else 3
                     if i < limit:
                         if past_race_id not in deep_dive_candidates or i < deep_dive_candidates[past_race_id]:
@@ -273,7 +289,6 @@ class NetkeibaScraper:
                 del past_races_dict[rid]
                 deep_dive_candidates.pop(rid, None)
 
-        # 出走馬の共通レースの全馬を取得
         for past_id in deep_dive_candidates.keys():
             time.sleep(0.3)
             db_url = f"https://db.netkeiba.com/race/{past_id}/"
@@ -339,7 +354,6 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
     cur_dist = int(current_dist) if str(current_dist).isdigit() else 0
     cap_val = 30.0 if is_banei else 1.5
 
-    # 1. グラフ(G)の構築
     for race_id, race in past_races_dict.items():
         if race.get('track_type') != current_track: continue
         
@@ -380,7 +394,6 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
 
     pair_net = {u: {v: [] for v in current_names} for u in current_names}
 
-    # 2. ペアごとのルート探索とルール適用
     for u in current_names:
         for v in current_names:
             if u == v: continue
@@ -397,11 +410,12 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
                 same_cond = []
                 other_cond = []
                 for diff, dt, place, dist in direct_entries:
-                    # 1ターン縛り
                     if _is_one_turn(current_course, cur_dist) and not _is_one_turn(place, dist): continue
                     
                     dist_int = int(dist) if str(dist).isdigit() else 0
-                    if place == current_course and dist_int == cur_dist:
+                    
+                    # グループ判定（姫路と園田などは同じ場所として扱う）
+                    if get_track_group(place) == get_track_group(current_course) and dist_int == cur_dist:
                         same_cond.append((diff, dt, place, dist))
                     else:
                         other_cond.append((diff, place, dist))
@@ -439,29 +453,29 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
                 loose_diffs = []
                 for diff_uh, p_uh, d_uh, dt_uh in u_h_hist:
                     for diff_hv, p_hv, d_hv, dt_hv in h_v_hist:
-                        # 大井内外ハイブリッド禁止
                         if p_uh == "大井" and p_hv == "大井":
                             if (_is_ooi_inner(d_uh) and _is_ooi_outer(d_hv)) or (_is_ooi_outer(d_uh) and _is_ooi_inner(d_hv)): continue
-                        # 1ターン縛り
+                        
                         if _is_one_turn(current_course, cur_dist):
                             if not _is_one_turn(p_uh, d_uh) or not _is_one_turn(p_hv, d_hv): continue
 
                         date_to_use = dt_uh if dt_uh > dt_hv else dt_hv
-                        if p_uh == p_hv and _is_same_track_layout(p_uh, d_uh, d_hv):
+                        
+                        # グループ判定（姫路と園田などは同じ場所として扱う）
+                        if get_track_group(p_uh) == get_track_group(p_hv) and _is_same_track_layout(p_uh, d_uh, d_hv):
                             strict_diffs.append((diff_uh + diff_hv, p_uh, d_uh, date_to_use))
                         else:
                             loose_diffs.append((diff_uh + diff_hv, p_uh, d_uh, date_to_use))
 
                 if strict_diffs:
                     raw_hidden_diff = sum(x[0] for x in strict_diffs) / len(strict_diffs)
-                    discounted_diff = raw_hidden_diff * 0.8  # 隠れ馬は0.8倍
+                    discounted_diff = raw_hidden_diff * 0.8  
                     pair_net[u][v].append((discounted_diff, True, strict_diffs[0][1], strict_diffs[0][2], False, strict_diffs[0][3]))
                 elif loose_diffs:
                     raw_hidden_diff = sum(x[0] for x in loose_diffs) / len(loose_diffs)
-                    discounted_diff = raw_hidden_diff * 0.5  # 条件違いは0.5倍
+                    discounted_diff = raw_hidden_diff * 0.5  
                     pair_net[u][v].append((discounted_diff, False, loose_diffs[0][1], loose_diffs[0][2], False, loose_diffs[0][3]))
 
-    # 3. マトリクスとリーグ戦勝点の計算
     matchup_matrix = {u: {} for u in current_names}
     is_direct_matrix = {u: {} for u in current_names}
     date_matrix = {u: {} for u in current_names}
@@ -530,51 +544,49 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
                     elif rel == "<": pts_add = -1.5
                     elif rel == "<<": pts_add = -3.0
                     
-                    # 隠れ馬割引
                     if not is_dir: pts_add *= 0.8
                     
-                    # 鮮度割引
                     decay = calculate_time_decay(r_date)
                     pts_add *= decay
                     pts += pts_add
             
-            # 試合数ボーナス
             avg_pts = (pts / count) + (count * 0.1) if count > 0 else 0
             horse_points[u] = avg_pts
 
         ranked_pool = sorted(horse_points.items(), key=lambda x: x[1], reverse=True)
-        top_score = ranked_pool[0][1]
         
-        for h, score in ranked_pool:
-            diff_from_top = top_score - score
+        # 【ギャップ法（点差）によるランク分け】
+        tier_labels = ["S", "A", "B", "C"]
+        current_tier_idx = 0
+        all_tiers[ranked_pool[0][0]] = tier_labels[current_tier_idx]
+        
+        for i in range(1, len(ranked_pool)):
+            prev_horse, prev_score = ranked_pool[i-1]
+            curr_horse, curr_score = ranked_pool[i]
             
-            if score >= 1.0 and diff_from_top <= 0.8: all_tiers[h] = "S"
-            elif score >= 0.0: all_tiers[h] = "A"
-            elif score >= -1.0: all_tiers[h] = "B"
-            else: all_tiers[h] = "C"
+            gap = prev_score - curr_score
+            # スコア差が0.6以上開いたらランクを1つ下げる
+            if gap >= 0.6 and current_tier_idx < len(tier_labels) - 1:
+                current_tier_idx += 1
                 
-        # 下剋上防止の強制補正
-        tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
-        val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
-        
-        for _ in range(3): 
+            all_tiers[curr_horse] = tier_labels[current_tier_idx]
+                
+        # 【下剋上防止（引き上げ型）】
+        for _ in range(2): 
             changed = False
             for u in pool:
                 for v in pool:
                     if u == v: continue
                     rel = matchup_matrix[u].get(v)
                     if rel in [">>", ">"]:
-                        t_u = tier_val[all_tiers[u]]
-                        t_v = tier_val[all_tiers[v]]
-                        if t_u <= t_v:
+                        t_u_idx = tier_labels.index(all_tiers[u])
+                        t_v_idx = tier_labels.index(all_tiers[v])
+                        
+                        if t_u_idx > t_v_idx:
                             rel_reverse = matchup_matrix[v].get(u)
                             if rel_reverse not in [">>", ">"]:
-                                if t_v > 1:
-                                    all_tiers[v] = val_tier[t_v - 1]
-                                    changed = True
-                                elif t_u < 4:
-                                    all_tiers[u] = val_tier[t_u + 1]
-                                    changed = True
+                                all_tiers[u] = tier_labels[t_v_idx]
+                                changed = True
             if not changed: break
 
     return all_tiers, pair_net, G
@@ -655,7 +667,7 @@ def build_html_output(all_tiers, pair_net, umaban_dict, current_course, current_
 
         for (r_date, r_place, r_dist), opps in sorted(race_groups.items(), key=lambda x: x[0][0], reverse=True):
             if not opps: continue
-            is_match = (r_place == current_course and str(r_dist) == str(current_dist))
+            is_match = (get_track_group(r_place) == get_track_group(current_course) and str(r_dist) == str(current_dist))
             style = "background:#fff9c4; border-left:3px solid #fbc02d; padding-left:5px;" if is_match else ""
             badge = " <span style='color:#fbc02d; font-weight:bold;'>[同条件]</span>" if is_match else ""
             
@@ -673,7 +685,7 @@ def build_html_output(all_tiers, pair_net, umaban_dict, current_course, current_
             for diff, is_strict, p_place, p_dist, is_dir, r_date in pair_net[hname][opp_n]:
                 if not is_dir:
                     opp_u = umaban_dict.get(opp_n, "?")
-                    is_same_cond = (p_place == current_course and str(p_dist) == str(current_dist))
+                    is_same_cond = (get_track_group(p_place) == get_track_group(current_course) and str(p_dist) == str(current_dist))
                     c_label = f"{p_place}{p_dist}"
                     if not is_strict: c_label = f"条件違({c_label})"
                     
@@ -717,7 +729,6 @@ def build_html_output(all_tiers, pair_net, umaban_dict, current_course, current_
 def wrap_combined_html(results_list):
     """
     複数のレースのHTMLを、1つのタブ切り替え可能なHTMLファイルにまとめる
-    results_list: [(r_num, r_title, content_html), ...]
     """
     tabs_html = ""
     contents_html = ""
@@ -778,7 +789,6 @@ def wrap_combined_html(results_list):
 # ==========================================
 st.set_page_config(page_title="競馬AI 相対評価ツール", page_icon="🏇", layout="centered")
 
-# チェックボックス用のセッションステートを初期化
 if "chk_initialized" not in st.session_state:
     st.session_state.chk_initialized = True
     for i in range(1, 13):
@@ -791,7 +801,7 @@ def deselect_all_races():
     for i in range(1, 13): st.session_state[f"chk_{i}"] = False
 
 st.title("🏇 競馬AI 相対評価ツール (JRA/地方対応)")
-st.caption("NetkeibaのレースURLから、最新の「1ターン縛り」「時間減衰」「試合数ボーナス」等を用いた相対序列を出力します。")
+st.caption("NetkeibaのレースURLから、最新の「1ターン縛り」「時間減衰」「試合数ボーナス」「同距離至上主義（地方競馬）」等を用いた相対序列を出力します。")
 
 url_input = st.text_input("netkeibaのレースURL (基準となるURLを1つ入力)", placeholder="https://race.netkeiba.com/race/result.html?race_id=202405020111")
 water_mode = st.selectbox("水分量フィルタ（ばんえい専用）", options=["なし", "軽馬場（dry）", "重馬場（wet）"])
@@ -799,12 +809,10 @@ water_mode = st.selectbox("水分量フィルタ（ばんえい専用）", optio
 st.markdown("---")
 st.write("🎯 **一括分析するレースを選択**")
 
-# 全選択 / 全解除 ボタン
 c1, c2, _ = st.columns([1, 1, 3])
 c1.button("✅ 全選択", on_click=select_all_races)
 c2.button("⬜ 全解除", on_click=deselect_all_races)
 
-# 1R〜12Rのチェックボックスを配置
 cols = st.columns(4)
 for i in range(1, 13):
     cols[(i-1)%4].checkbox(f"{i}R", key=f"chk_{i}")
@@ -820,10 +828,8 @@ if submitted:
         st.error("正しいnetkeibaのURLを入力してください（例：https://race.netkeiba.com/race/result.html?race_id=...）")
         st.stop()
 
-    # 選択されたレース番号を取得
     selected_races = [i for i in range(1, 13) if st.session_state[f"chk_{i}"]]
     
-    # もし1つもチェックされていなければ、URLに入っているレース番号だけを実行する
     if not selected_races:
         try:
             selected_races = [int(base_race_id[-2:])]
@@ -842,7 +848,6 @@ if submitted:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # 選択されたレースをループ処理
     for idx, rid in enumerate(race_ids_to_process):
         r_num = int(rid[-2:])
         status_text.text(f"処理中: {r_num}R ... ({idx+1}/{len(race_ids_to_process)})")
@@ -867,10 +872,8 @@ if submitted:
 
     status_text.success("✅ すべての分析が完了しました！")
 
-    # ダウンロード用の一括HTMLを生成
     combined_html_doc = wrap_combined_html(results_list)
     
-    # 画面上部にダウンロードボタンを設置
     st.download_button(
         label="📥 分析結果をHTMLファイルとして一括保存（ダウンロード）",
         data=combined_html_doc,
@@ -880,7 +883,6 @@ if submitted:
     )
     st.markdown("---")
 
-    # 画面上（Streamlit）でタブ分けして表示
     tabs = st.tabs([f"{r[0]}R" for r in results_list])
     for tab, (r_num, r_title, r_html) in zip(tabs, results_list):
         with tab:
