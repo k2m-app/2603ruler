@@ -414,11 +414,10 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
                     
                     dist_int = int(dist) if str(dist).isdigit() else 0
                     
-                    # グループ判定（姫路と園田などは同じ場所として扱う）
                     if get_track_group(place) == get_track_group(current_course) and dist_int == cur_dist:
                         same_cond.append((diff, dt, place, dist))
                     else:
-                        other_cond.append((diff, place, dist))
+                        other_cond.append((diff, dt, place, dist)) # 日付も保存
 
                 if same_cond:
                     if len(same_cond) == 1:
@@ -435,9 +434,9 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
                         max_other_item = max(other_cond, key=lambda x: x[0])
                         max_other = max_other_item[0]
                         if max_other > 1.0:
-                            pair_net[u][v].append((max_other * 0.4, False, max_other_item[1], max_other_item[2], True, "不明"))
+                            pair_net[u][v].append((max_other * 0.4, False, max_other_item[2], max_other_item[3], True, max_other_item[1]))
                         for oc in other_cond:
-                            pair_net[u][v].append((oc[0], False, oc[1], oc[2], True, "不明"))
+                            pair_net[u][v].append((oc[0], False, oc[2], oc[3], True, oc[1]))
 
             hidden_nodes = [n for n in G.nodes() if n not in current_names]
             for h in hidden_nodes:
@@ -461,7 +460,6 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
 
                         date_to_use = dt_uh if dt_uh > dt_hv else dt_hv
                         
-                        # グループ判定（姫路と園田などは同じ場所として扱う）
                         if get_track_group(p_uh) == get_track_group(p_hv) and _is_same_track_layout(p_uh, d_uh, d_hv):
                             strict_diffs.append((diff_uh + diff_hv, p_uh, d_uh, date_to_use))
                         else:
@@ -556,39 +554,14 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
         ranked_pool = sorted(horse_points.items(), key=lambda x: x[1], reverse=True)
         top_score = ranked_pool[0][1]
         
-        # 【修正】絶対スコア基準によるランク分け（インフレ防止）
+        # 【修正】絶対スコア基準によるランク分け（インフレ防止・下剋上廃止で安定化）
         for h, score in ranked_pool:
             diff_from_top = top_score - score
             
-            if score >= 1.0 and diff_from_top <= 0.8: all_tiers[h] = "S"
+            if score >= 1.0 and diff_from_top <= 1.0: all_tiers[h] = "S"
             elif score >= 0.0: all_tiers[h] = "A"
             elif score >= -1.0: all_tiers[h] = "B"
             else: all_tiers[h] = "C"
-                
-        # 【修正】下剋上防止ロジック（降格型：矛盾を見つけたら負けた方を下げる）
-        tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
-        val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
-        
-        for _ in range(3): 
-            changed = False
-            for u in pool:
-                for v in pool:
-                    if u == v: continue
-                    rel = matchup_matrix[u].get(v)
-                    if rel in [">>", ">"]:
-                        t_u = tier_val[all_tiers[u]]
-                        t_v = tier_val[all_tiers[v]]
-                        if t_u <= t_v:
-                            rel_reverse = matchup_matrix[v].get(u)
-                            if rel_reverse not in [">>", ">"]:
-                                # 基本は負けた方を1ランク下げる。すでにCランクなら勝った方を上げる
-                                if t_v > 1:
-                                    all_tiers[v] = val_tier[t_v - 1]
-                                    changed = True
-                                elif t_u < 4:
-                                    all_tiers[u] = val_tier[t_u + 1]
-                                    changed = True
-            if not changed: break
 
     return all_tiers, pair_net, G
 
