@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from app import (
     NetkeibaScraper,
     build_unified_graph,
+    calculate_pagerank,  # 💡 新規追加：PageRank計算関数
     analyze_all_horses_html,
 )
 
@@ -62,9 +63,12 @@ def run_analysis(race_id: str, water_mode: str | None = None):
         past_races, target_course, target_track, target_distance, umaban_dict
     )
     
-    # 💡 ここがエラーの原因でした！ 引数に `past_races` を追加して引数のズレを解消しました。
+    # 💡 新規追加：構築したグラフからPageRankスコアを計算
+    pr_scores = calculate_pagerank(G_unified)
+    
+    # 💡 修正：pr_scoresを引数として渡す
     result_html_content, _, _, _, _ = analyze_all_horses_html(
-        G_unified, past_races, umaban_dict, target_course, target_distance, race_id=None, is_banei=is_banei
+        G_unified, past_races, umaban_dict, target_course, target_distance, pr_scores, race_id=None, is_banei=is_banei
     )
 
     water_note = ""
@@ -72,10 +76,11 @@ def run_analysis(race_id: str, water_mode: str | None = None):
         label = "1.9%以下（軽馬場）" if water_mode == "dry" else "2.0%以上（重馬場）"
         water_note = f"<p style='color:#2980b9; font-size:13px;'>💧 水分量フィルタ: <strong>{label}</strong></p>"
         
+    t_track_disp = f"大井({target_distance}m基準)" if target_course == '大井' else target_course
     result_html = (
         f"{water_note}"
-        f"<h2 class='section-title'>📊 {target_course} {target_distance}m 基準：能力序列<br>"
-        f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※直近の同条件レースを最優先。隠れ馬経由はノイズ割引(×0.7)を適用</span></h2>"
+        f"<h2 class='section-title'>📊 {t_track_disp} 基準：能力序列<br>"
+        f"<span style='font-size:0.75em; font-weight:normal; color:#bdc3c7;'>※PageRankによるトーナメント抽出。同列は0.5秒差未満に設定</span></h2>"
         f"{result_html_content}"
     )
 
@@ -142,7 +147,6 @@ if submitted:
                 components.html(full_html, height=3000, scrolling=True)
             except Exception as e:
                 st.error(f"エラーが発生しました: {e}")
-                # 万が一エラーが出た際、どこが悪いかすぐ分かるように詳細を表示する安全装置を追加
                 import traceback
                 st.code(traceback.format_exc())
     else:
