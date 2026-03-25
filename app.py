@@ -554,39 +554,40 @@ def calculate_relative_scores_advanced(past_races_dict, current_course, current_
             horse_points[u] = avg_pts
 
         ranked_pool = sorted(horse_points.items(), key=lambda x: x[1], reverse=True)
+        top_score = ranked_pool[0][1]
         
-        # 【ギャップ法（点差）によるランク分け】
-        tier_labels = ["S", "A", "B", "C"]
-        current_tier_idx = 0
-        all_tiers[ranked_pool[0][0]] = tier_labels[current_tier_idx]
-        
-        for i in range(1, len(ranked_pool)):
-            prev_horse, prev_score = ranked_pool[i-1]
-            curr_horse, curr_score = ranked_pool[i]
+        # 【修正】絶対スコア基準によるランク分け（インフレ防止）
+        for h, score in ranked_pool:
+            diff_from_top = top_score - score
             
-            gap = prev_score - curr_score
-            # スコア差が0.6以上開いたらランクを1つ下げる
-            if gap >= 0.6 and current_tier_idx < len(tier_labels) - 1:
-                current_tier_idx += 1
+            if score >= 1.0 and diff_from_top <= 0.8: all_tiers[h] = "S"
+            elif score >= 0.0: all_tiers[h] = "A"
+            elif score >= -1.0: all_tiers[h] = "B"
+            else: all_tiers[h] = "C"
                 
-            all_tiers[curr_horse] = tier_labels[current_tier_idx]
-                
-        # 【下剋上防止（引き上げ型）】
-        for _ in range(2): 
+        # 【修正】下剋上防止ロジック（降格型：矛盾を見つけたら負けた方を下げる）
+        tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
+        val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
+        
+        for _ in range(3): 
             changed = False
             for u in pool:
                 for v in pool:
                     if u == v: continue
                     rel = matchup_matrix[u].get(v)
                     if rel in [">>", ">"]:
-                        t_u_idx = tier_labels.index(all_tiers[u])
-                        t_v_idx = tier_labels.index(all_tiers[v])
-                        
-                        if t_u_idx > t_v_idx:
+                        t_u = tier_val[all_tiers[u]]
+                        t_v = tier_val[all_tiers[v]]
+                        if t_u <= t_v:
                             rel_reverse = matchup_matrix[v].get(u)
                             if rel_reverse not in [">>", ">"]:
-                                all_tiers[u] = tier_labels[t_v_idx]
-                                changed = True
+                                # 基本は負けた方を1ランク下げる。すでにCランクなら勝った方を上げる
+                                if t_v > 1:
+                                    all_tiers[v] = val_tier[t_v - 1]
+                                    changed = True
+                                elif t_u < 4:
+                                    all_tiers[u] = val_tier[t_u + 1]
+                                    changed = True
             if not changed: break
 
     return all_tiers, pair_net, G
