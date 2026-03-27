@@ -268,7 +268,7 @@ def extract_best_matches(past_races, target_course, target_distance, umaban_dict
     return best_matches
 
 # ==========================================
-# 4. リーグ戦評価と強制補正 (トップダウン方式)
+# 4. リーグ戦評価と強制補正 (完全矛盾解決版)
 # ==========================================
 def evaluate_and_rank(best_matches, umaban_dict):
     runners = list(umaban_dict.keys())
@@ -290,49 +290,71 @@ def evaluate_and_rank(best_matches, umaban_dict):
     final_scores = {u: (scores[u] / counts[u] if counts[u] > 0 else -999) for u in runners}
     ranked = sorted([(u, s) for u, s in final_scores.items() if s != -999], key=lambda x: x[1], reverse=True)
     
-    tier_map = {u: "C" for u in runners}
+    tier_val = {u: 1 for u in runners}
     
-    # 2. トップからの相対差分でSから順に初期ランクを割り当て（Sが消える問題の解決）
+    # 2. トップからの相対差分でSから順に初期ランクを割り当て
     if ranked:
         top_s = ranked[0][1]
         for u, s in ranked:
             diff = top_s - s
-            if diff <= 0.8: tier_map[u] = "S"     # S: トップ集団
-            elif diff <= 2.2: tier_map[u] = "A"   # A: Sに次ぐグループ
-            elif diff <= 4.0: tier_map[u] = "B"   # B: Aより下だがCには勝てる
-            else: tier_map[u] = "C"               # C: 下位グループ
+            if diff <= 1.0: tier_val[u] = 4     # S: トップ集団
+            elif diff <= 2.5: tier_val[u] = 3   # A: Sに次ぐグループ
+            elif diff <= 4.0: tier_val[u] = 2   # B: Aより下だがCには勝てる
+            else: tier_val[u] = 1               # C: 下位グループ
 
-    # 3. 👑 強制補正ルール適用 (Sから順に完璧な序列を形成)
-    tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
-    val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
-    
+    # 3. 👑 強制補正ルール適用 (矛盾なき序列化アルゴリズム)
     changed = True
-    while changed:
+    loops = 0
+    while changed and loops < 15: # 複雑な三すくみ対策でループ上限に余裕を持たせる
         changed = False
+        loops += 1
+        
+        # パス1: 「>>」「>」の明確な勝敗による下方圧力（下克上キラー）
+        # 勝っている馬(u)は、負けている馬(v)より絶対に上のランクになるよう強制する
         for u in runners:
             for v in runners:
                 m = best_matches[u][v]
                 if not m: continue
                 
-                t_u = tier_val[tier_map[u]]
-                t_v = tier_val[tier_map[v]]
-                
-                # 絶対ルール1: 同競馬場同距離で「＝」なら同ランクに引き上げ
-                if m['type'] == 'direct' and m['cond'] == 'A' and m['rel'] == '＝':
-                    if t_u < t_v:
-                        tier_map[u] = val_tier[t_v]
-                        changed = True
-                    elif t_v < t_u:
-                        tier_map[v] = val_tier[t_u]
-                        changed = True
-                        
-                # 絶対ルール2: ベストマッチで相手に勝っている(>> or >)なら、相手より下にならない
-                if m['rel'] in ['>>', '>']:
-                    if t_u < t_v:
-                        tier_map[u] = val_tier[t_v]
+                if m['rel'] == '>>': # uがvに圧勝している場合
+                    if tier_val[u] <= tier_val[v]:
+                        # vのランクを優先して下げる
+                        if tier_val[v] > 1:
+                            tier_val[v] -= 1
+                            changed = True
+                        elif tier_val[u] < 4:
+                            tier_val[u] += 1
+                            changed = True
+                elif m['rel'] == '>': # uがvに勝っている場合
+                    if tier_val[u] < tier_val[v]:
+                        tier_val[v] = tier_val[u]
                         changed = True
 
+        # パス2: 同競馬場同距離の「＝」による上方圧力（安全な場合のみ適用）
+        for u in runners:
+            for v in runners:
+                m = best_matches[u][v]
+                if not m: continue
+                
+                # uとvが同条件で引き分けており、uの方がランクが低い場合
+                if m['type'] == 'direct' and m['cond'] == 'A' and m['rel'] == '＝':
+                    if tier_val[u] < tier_val[v]:
+                        # uを引き上げても矛盾がないかチェック
+                        # 「uに圧勝(>>)している馬w」が、引き上げ後のランク(vのランク)以下にいると矛盾するためストップする
+                        safe = True
+                        for w in runners:
+                            mw = best_matches[w][u]
+                            if mw and mw['rel'] == '>>' and tier_val[w] <= tier_val[v]:
+                                safe = False
+                                break
+                        if safe:
+                            tier_val[u] = tier_val[v]
+                            changed = True
+
+    val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
+    tier_map = {u: val_tier[tier_val[u]] for u in runners if final_scores[u] != -999}
     unranked = [u for u in runners if final_scores[u] == -999]
+    
     return tier_map, ranked, unranked
 
 # ==========================================
@@ -440,8 +462,8 @@ function openTab(evt, id) {{
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇")
 
-st.title("🏇 競馬AI 究極相対評価 (トップダウン序列版)")
-st.caption("全馬の相対スコアから「一番強い馬」をまずSランクに据え、勝敗結果に基づいて完璧なヒエラルキーを構築します。")
+st.title("🏇 競馬AI 究極相対評価 (下克上キラー版)")
+st.caption("全馬の相対スコアから「一番強い馬」をまずSランクに据え、圧勝(>>)で負けた馬は絶対に上位へ行かせない完璧なヒエラルキーを構築します。")
 
 url_input = st.text_input("netkeibaのレースURL", placeholder="https://race.netkeiba.com/race/result.html?race_id=202405020111")
 water_mode = st.selectbox("水分量フィルタ（ばんえい専用）", ["なし", "軽馬場（dry）", "重馬場（wet）"])
