@@ -128,7 +128,6 @@ class NetkeibaScraper:
                 umaban_dict[horse_name] = tds[1].text.strip()
 
             past_tds = tr.find_all('td', class_=re.compile(r'^Past'))
-            # 直近3走程度をベースに取得
             for i, td in enumerate(past_tds[:4]):
                 data01 = td.find('div', class_='Data01')
                 data02_a = td.find('div', class_='Data02').find('a') if td.find('div', class_='Data02') else None
@@ -198,7 +197,6 @@ class NetkeibaScraper:
 # ==========================================
 def extract_best_matches(past_races, target_course, target_distance, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
-    # 直接対決履歴の収集
     history = {u: {v: [] for v in runners} for u in runners}
     
     for race in past_races:
@@ -229,7 +227,6 @@ def extract_best_matches(past_races, target_course, target_distance, umaban_dict
 
     best_matches = {u: {v: None for v in runners} for u in runners}
     
-    # 優先順位でベストマッチを決定
     for u in runners:
         for v in runners:
             if u == v: continue
@@ -248,12 +245,10 @@ def extract_best_matches(past_races, target_course, target_distance, umaban_dict
                 best_matches[u][v] = {**best_m, 'type': 'direct'}
                 continue
             
-            # 隠れ馬経由の探索
             indirects = []
             for h in history[u].keys():
                 if h in runners: continue
                 if h in history and v in history[h] and history[u][h] and history[h][v]:
-                    # u->h と h->v の最新を使用
                     m_uh = sorted(history[u][h], key=lambda x: x['date'], reverse=True)[0]
                     m_hv = sorted(history[h][v], key=lambda x: x['date'], reverse=True)[0]
                     tot_diff = m_uh['raw_diff'] + m_hv['raw_diff']
@@ -267,28 +262,27 @@ def extract_best_matches(past_races, target_course, target_distance, umaban_dict
                     })
                     
             if indirects:
-                # 隠れ馬ルートが複数あれば、日付が新しいものを優先
                 indirects.sort(key=lambda x: x['date'], reverse=True)
                 best_matches[u][v] = indirects[0]
 
     return best_matches
 
 # ==========================================
-# 4. リーグ戦評価と強制補正
+# 4. リーグ戦評価と強制補正 (トップダウン方式)
 # ==========================================
 def evaluate_and_rank(best_matches, umaban_dict):
     runners = list(umaban_dict.keys())
     scores = {u: 0.0 for u in runners}
     counts = {u: 0 for u in runners}
     
-    # スコア集計
+    # 1. スコア集計
     for u in runners:
         for v in runners:
             m = best_matches[u][v]
             if not m: continue
             
             pts = calculate_matchup_points(m['rel'])
-            if m['type'] == 'indirect': pts *= 0.6 # 隠れ馬は影響を抑える
+            if m['type'] == 'indirect': pts *= 0.6 
             
             scores[u] += pts
             counts[u] += 1
@@ -297,15 +291,18 @@ def evaluate_and_rank(best_matches, umaban_dict):
     ranked = sorted([(u, s) for u, s in final_scores.items() if s != -999], key=lambda x: x[1], reverse=True)
     
     tier_map = {u: "C" for u in runners}
+    
+    # 2. トップからの相対差分でSから順に初期ランクを割り当て（Sが消える問題の解決）
     if ranked:
         top_s = ranked[0][1]
         for u, s in ranked:
-            if s >= 1.5 and (top_s - s) <= 1.0: tier_map[u] = "S"
-            elif s >= 0.5: tier_map[u] = "A"
-            elif s >= -1.0: tier_map[u] = "B"
-            else: tier_map[u] = "C"
+            diff = top_s - s
+            if diff <= 0.8: tier_map[u] = "S"     # S: トップ集団
+            elif diff <= 2.2: tier_map[u] = "A"   # A: Sに次ぐグループ
+            elif diff <= 4.0: tier_map[u] = "B"   # B: Aより下だがCには勝てる
+            else: tier_map[u] = "C"               # C: 下位グループ
 
-    # 👑 強制補正ルール適用
+    # 3. 👑 強制補正ルール適用 (Sから順に完璧な序列を形成)
     tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
     val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
     
@@ -320,7 +317,7 @@ def evaluate_and_rank(best_matches, umaban_dict):
                 t_u = tier_val[tier_map[u]]
                 t_v = tier_val[tier_map[v]]
                 
-                # 絶対ルール1: 同競馬場同距離で「＝」なら同ランク
+                # 絶対ルール1: 同競馬場同距離で「＝」なら同ランクに引き上げ
                 if m['type'] == 'direct' and m['cond'] == 'A' and m['rel'] == '＝':
                     if t_u < t_v:
                         tier_map[u] = val_tier[t_v]
@@ -329,7 +326,7 @@ def evaluate_and_rank(best_matches, umaban_dict):
                         tier_map[v] = val_tier[t_u]
                         changed = True
                         
-                # 絶対ルール2: ベストマッチで相手に勝っているなら、相手より下にならない
+                # 絶対ルール2: ベストマッチで相手に勝っている(>> or >)なら、相手より下にならない
                 if m['rel'] in ['>>', '>']:
                     if t_u < t_v:
                         tier_map[u] = val_tier[t_v]
@@ -443,8 +440,8 @@ function openTab(evt, id) {{
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇")
 
-st.title("🏇 競馬AI 究極相対評価 (ベストマッチ＆隠れ馬版)")
-st.caption("優先順位（同競馬場同距離が最優先）に基づいて各馬の「決定的な1戦」を抽出し、完璧な序列を組み上げます。")
+st.title("🏇 競馬AI 究極相対評価 (トップダウン序列版)")
+st.caption("全馬の相対スコアから「一番強い馬」をまずSランクに据え、勝敗結果に基づいて完璧なヒエラルキーを構築します。")
 
 url_input = st.text_input("netkeibaのレースURL", placeholder="https://race.netkeiba.com/race/result.html?race_id=202405020111")
 water_mode = st.selectbox("水分量フィルタ（ばんえい専用）", ["なし", "軽馬場（dry）", "重馬場（wet）"])
