@@ -52,27 +52,35 @@ def determine_condition(t_place, t_dist, r_place, r_dist):
     
     return 'C'
 
+def get_rel_str(diff, cond, is_banei=False):
+    """ 着差から関係性文字列(>>, >, ＝, <, <<)を取得 """
+    abs_d = abs(diff)
+    if is_banei:
+        if abs_d >= 4.0: return ">>" if diff < 0 else "<<"
+        if abs_d >= 1.5: return ">" if diff < 0 else "<"
+        return "＝"
+        
+    if cond == 'A':
+        if abs_d >= 1.1: return ">>" if diff < 0 else "<<"
+        if abs_d >= 0.6: return ">" if diff < 0 else "<"
+        return "＝"
+    elif cond == 'B':
+        if abs_d >= 1.3: return ">>" if diff < 0 else "<<"
+        if abs_d >= 0.8: return ">" if diff < 0 else "<"
+        return "＝"
+    else: # cond == 'C'
+        if abs_d >= 1.5: return ">>" if diff < 0 else "<<"
+        if abs_d >= 1.0: return ">" if diff < 0 else "<"
+        return "＝"
+
 def calculate_matchup_points(diff, cond, is_banei=False):
     """ 着差と条件から基礎ポイントを算出 (負けの場合はマイナス) """
-    abs_diff = abs(diff)
-    pts = 0.0
-    
-    if is_banei:
-        if abs_diff >= 4.0: pts = 3.0
-        elif abs_diff >= 1.5: pts = 1.0
-    else:
-        if cond == 'A':
-            if abs_diff >= 1.1: pts = 3.0
-            elif abs_diff >= 0.6: pts = 1.0
-        elif cond == 'B':
-            if abs_diff >= 1.3: pts = 3.0
-            elif abs_diff >= 0.8: pts = 1.0
-        elif cond == 'C':
-            if abs_diff >= 1.5: pts = 3.0
-            elif abs_diff >= 1.0: pts = 1.0
-
-    # diff < 0 は自馬の先着(勝ち)
-    return pts if diff <= 0 else -pts
+    rel = get_rel_str(diff, cond, is_banei)
+    if rel == ">>": return 3.0
+    elif rel == ">": return 1.0
+    elif rel == "<<": return -3.0
+    elif rel == "<": return -1.0
+    return 0.0
 
 # ==========================================
 # 2. Netkeiba ディープスクレイパー
@@ -211,13 +219,12 @@ def build_matchup_graph(past_races, target_course, target_distance, umaban_dict,
     G = nx.DiGraph()
     runners = list(umaban_dict.keys())
     
-    # 全馬をノードとして追加
     for r in runners:
         G.add_node(r)
 
-    # 過去レース履歴の整理
     match_history = {u: {v: [] for v in runners} for u in runners}
 
+    # 直接対決の収集
     for race in past_races:
         r_course = race['course']
         r_dist = race['distance']
@@ -225,7 +232,6 @@ def build_matchup_graph(past_races, target_course, target_distance, umaban_dict,
         r_date_str = race['date_str']
         
         cond = determine_condition(target_course, target_distance, r_course, r_dist)
-        
         horses_in_race = [h for h in race['horses'].items() if h[0] in umaban_dict or h[1] < 2.0]
         
         for i in range(len(horses_in_race)):
@@ -251,7 +257,7 @@ def build_matchup_graph(past_races, target_course, target_distance, umaban_dict,
                     if not G.has_edge(h2, h1): G.add_edge(h2, h1, history=[])
                     G[h2][h1]['history'].append({**hist_entry, 'raw_diff': -diff, 'pts_h1': -pts_h1})
 
-    # 直接対決の勝負づけ完了ポイント計算
+    # 対戦スコアの集計
     for u in runners:
         for v in runners:
             if u == v or not match_history[u][v]: continue
@@ -268,91 +274,43 @@ def build_matchup_graph(past_races, target_course, target_distance, umaban_dict,
                 
             G.add_edge(u, v, score=total_score, history=history, is_direct=True)
 
-    # 隠れ馬経由の間接スコア計算（割引あり）
-    for u in runners:
-        for v in runners:
-            if u == v or G.has_edge(u, v): continue
-            
-            indirect_scores = []
-            for hidden in G.nodes():
-                if hidden in runners: continue
-                if G.has_edge(u, hidden) and G.has_edge(hidden, v):
-                    # 隠れ馬に対するポイントを合算（ただし不確実性のため0.5倍）
-                    u_to_h = sum(h['pts_h1'] for h in G[u][hidden]['history'])
-                    h_to_v = sum(h['pts_h1'] for h in G[hidden][v]['history'])
-                    implied_score = (u_to_h + h_to_v) * 0.5
-                    indirect_scores.append(implied_score)
-            
-            if indirect_scores:
-                avg_indirect = sum(indirect_scores) / len(indirect_scores)
-                G.add_edge(u, v, score=avg_indirect, history=[], is_direct=False)
-
-    return G
+    return G, match_history
 
 # ==========================================
-# 4. リーグ戦評価 ＆ 👑無敗ボーナス
+# 4. リーグ戦評価 ＆ 👑ランク強制補正
 # ==========================================
-def evaluate_league(G, umaban_dict):
+def evaluate_league(G, match_history, umaban_dict):
     runners = list(umaban_dict.keys())
-    matchup_results = {u: {} for u in runners}
     
-    # 対戦関係の決定
+    league_scores = {u: 0.0 for u in runners}
+    opponents_count = {u: 0 for u in runners}
+
+    # 1. リーグ戦ポイントの計算
     for u in runners:
         for v in runners:
             if u == v or not G.has_edge(u, v): continue
             
-            score = G[u][v]['score']
-            if score >= 4.0: rel = ">>"
-            elif score >= 1.0: rel = ">"
-            elif score > -1.0: rel = "="
-            elif score <= -4.0: rel = "<<"
-            else: rel = "<"
-            
-            matchup_results[u][v] = {'rel': rel, 'score': score, 'is_direct': G[u][v]['is_direct']}
-
-    # リーグ戦ポイント集計
-    league_scores = {u: 0.0 for u in runners}
-    opponents_count = {u: 0 for u in runners}
-    undefeated_flags = {u: True for u in runners}
-
-    for u in runners:
-        for v, data in matchup_results[u].items():
             opponents_count[u] += 1
-            rel = data['rel']
+            score = G[u][v]['score']
             
-            # リーグ基本点
-            if rel == ">>": pts = 3.0
-            elif rel == ">": pts = 1.0
-            elif rel == "=": pts = 0.2  # 「負けない」ことへの微小評価
-            elif rel == "<": pts = -1.5
-            elif rel == "<<": pts = -3.0
+            if score >= 4.0: pts = 3.0
+            elif score >= 1.0: pts = 1.0
+            elif score > -1.0: pts = 0.2
+            elif score <= -4.0: pts = -3.0
+            else: pts = -1.5
             
-            # 隠れ馬経由は影響を少し下げる
-            if not data['is_direct']: pts *= 0.7
             league_scores[u] += pts
-            
-            if rel in ["<", "<<"]:
-                undefeated_flags[u] = False
 
-    # 平均化 ＋ 無敗ボーナス適用
+    # 2. 初期ティア割り当て
     final_scores = {}
     for u in runners:
         if opponents_count[u] == 0:
-            final_scores[u] = -999.0 # 測定不能
+            final_scores[u] = -999.0
             continue
-            
-        avg = league_scores[u] / opponents_count[u]
-        
-        # 👑 無敗の帝王ボーナス (誰にも負けておらず、比較対象が複数いる場合)
-        has_bonus = undefeated_flags[u] and opponents_count[u] >= 1
-        if has_bonus:
-            avg += 2.5 # SランクやA上位に押し上げる強烈なボーナス
-            
-        final_scores[u] = avg
+        final_scores[u] = league_scores[u] / opponents_count[u]
 
-    # ティア分け
     ranked = sorted([(u, s) for u, s in final_scores.items() if s != -999.0], key=lambda x: x[1], reverse=True)
-    tier_map = {}
+    tier_map = {u: "C" for u in runners}
     
     if ranked:
         top_s = ranked[0][1]
@@ -362,18 +320,51 @@ def evaluate_league(G, umaban_dict):
             elif s >= -1.0: tier_map[u] = "B"
             else: tier_map[u] = "C"
 
-    unranked = [u for u in runners if final_scores[u] == -999.0]
+    # 3. 👑 負けていない馬の確実なランク引き上げ（下克上防止）
+    tier_val = {"S": 4, "A": 3, "B": 2, "C": 1}
+    val_tier = {4: "S", 3: "A", 2: "B", 1: "C"}
     
-    return tier_map, matchup_results, ranked, unranked, undefeated_flags
+    changed = True
+    while changed:
+        changed = False
+        for u in runners:
+            for v in runners:
+                if u == v or not match_history[u][v]: continue
+                
+                # uがvに一度も負けていないかチェック（pts_h1 < 0が一度もない）
+                has_loss = any(h['pts_h1'] < 0 for h in match_history[u][v])
+                if not has_loss:
+                    t_u = tier_val[tier_map[u]]
+                    t_v = tier_val[tier_map[v]]
+                    
+                    if t_u < t_v: # 負けていないのに相手よりランクが下なら引き上げる
+                        tier_map[u] = val_tier[t_v]
+                        changed = True
+
+    unranked = [u for u in runners if final_scores[u] == -999.0]
+    return tier_map, ranked, unranked
 
 # ==========================================
-# 5. HTMLレンダリング
+# 5. プロ仕様HTMLレンダリング
 # ==========================================
-def build_html_output(tier_map, matchup_results, ranked, unranked, undefeated_flags, umaban_dict, G):
+def build_html_output(tier_map, ranked, unranked, umaban_dict, match_history, G, is_banei):
     html = ["<div style='font-family: sans-serif; font-size:14px; color:#333;'>"]
     tier_colors = {"S": "#e74c3c", "A": "#e67e22", "B": "#f1c40f", "C": "#3498db"}
+    runners = list(umaban_dict.keys())
     
-    for tier in ["S", "A", "B", "C"]:
+    # S, 測定不能, A, B, C の順で出力
+    display_order = ["S", "UNRANKED", "A", "B", "C"]
+    
+    for tier in display_order:
+        if tier == "UNRANKED":
+            if unranked:
+                html.append("<h3 style='background-color:#95a5a6; color:white; padding:8px; border-radius:4px;'>❗ 測定不能（別路線）</h3>")
+                for u in unranked:
+                    html.append(f"<div style='margin-bottom: 15px; border-left: 4px solid #95a5a6; padding-left: 10px;'>")
+                    html.append(f"  <strong style='font-size:1.1em;'>[{umaban_dict.get(u, '?')}] {u}</strong>")
+                    html.append("</div>")
+            continue
+            
         horses_in_tier = [u for u, s in ranked if tier_map.get(u) == tier]
         if not horses_in_tier: continue
         
@@ -381,40 +372,77 @@ def build_html_output(tier_map, matchup_results, ranked, unranked, undefeated_fl
         
         for u in horses_in_tier:
             uma = umaban_dict.get(u, "?")
-            bonus_badge = " <span style='background:#f1c40f; color:#fff; padding:2px 6px; border-radius:12px; font-size:0.8em;'>👑 無敗ボーナス適用</span>" if undefeated_flags[u] else ""
             html.append(f"<div style='margin-bottom: 15px; border-left: 4px solid {tier_colors[tier]}; padding-left: 10px;'>")
-            html.append(f"  <strong style='font-size:1.1em;'>[{uma}] {u}</strong> {bonus_badge}")
-            html.append("  <ul style='margin-top:5px; padding-left:20px; font-size:0.9em;'>")
+            html.append(f"  <strong style='font-size:1.1em;'>[{uma}] {u}</strong>")
             
-            # 対戦履歴の詳細表示
-            for v, data in matchup_results[u].items():
-                rel = data['rel']
-                v_uma = umaban_dict.get(v, "?")
-                is_dir = data['is_direct']
-                
-                if rel in [">>", ">"]: color, sym = "#27ae60", rel
-                elif rel == "=": color, sym = "#888", "＝"
-                else: color, sym = "#e74c3c", rel
-                
-                dir_badge = "" if is_dir else "<span style='color:#9b59b6; font-size:0.8em;'>(隠れ馬経由)</span> "
-                
-                # 詳細な理由（履歴）
-                reasons = []
-                if is_dir and u in G and v in G[u]:
-                    for h in G[u][v]['history']:
-                        c_badge = f"[{h['cond']}]"
-                        sign = "+" if h['pts_h1'] > 0 else ""
-                        reasons.append(f"{h['date_str']} {h['course']}{h['distance']} {c_badge}({sign}{h['pts_h1']}Pt)")
-                
-                reason_str = f" <span style='color:#666; font-size:0.85em;'>... {', '.join(reasons)}</span>" if reasons else ""
-                
-                html.append(f"<li><span style='color:{color}; font-weight:bold;'>{sym}</span> [{v_uma}] {v} {dir_badge}{reason_str}</li>")
+            # --- 直接対決ブロック ---
+            direct_races = {}
+            w, d, l = 0, 0, 0
             
-            html.append("  </ul></div>")
+            for v in runners:
+                if u == v or not match_history[u][v]: continue
+                for hist in match_history[u][v]:
+                    r_key = (hist['date_str'], hist['course'], hist['distance'], hist['cond'])
+                    if r_key not in direct_races:
+                        direct_races[r_key] = []
+                    direct_races[r_key].append((v, hist['raw_diff'], hist['pts_h1'], hist['cond']))
+                    
+                    if hist['pts_h1'] > 0: w += 1
+                    elif hist['pts_h1'] < 0: l += 1
+                    else: d += 1
+                    
+            if direct_races:
+                wdl_str = []
+                if w: wdl_str.append(f"{w}勝")
+                if d: wdl_str.append(f"{d}分")
+                if l: wdl_str.append(f"{l}敗")
+                
+                html.append(f"<div style='margin-top:5px; font-size:0.9em; font-weight:bold;'>直接対決: {' '.join(wdl_str)}</div>")
+                
+                # レースごとの結果出力
+                sorted_races = sorted(direct_races.items(), key=lambda x: x[0][0] or "", reverse=True)
+                for (d_str, course, dist, cond), items in sorted_races:
+                    cond_badge = " <span style='color:#e67e22;'>[同条件]</span>" if cond == 'A' else ""
+                    html.append(f"<div style='margin-left:10px; font-size:0.85em; color:#555; margin-top:3px;'>🔍{d_str}の{course}{dist}{cond_badge}</div>")
+                    
+                    # 関係性ごとにグループ化
+                    rels = {">>": [], ">": [], "＝": [], "<": [], "<<": []}
+                    for v, diff, pts, h_cond in items:
+                        rel = get_rel_str(diff, h_cond, is_banei)
+                        v_uma = umaban_dict.get(v, "?")
+                        rels[rel].append(f"[{v_uma}]{v}({diff:+.1f})")
+                        
+                    for rel_key in [">>", ">", "＝", "<", "<<"]:
+                        if rels[rel_key]:
+                            color = "#27ae60" if ">" in rel_key else "#888" if rel_key == "＝" else "#e74c3c"
+                            html.append(f"<div style='margin-left:20px; font-size:0.85em;'>└ 本馬 <span style='color:{color}; font-weight:bold;'>{rel_key}</span> {' '.join(rels[rel_key])}</div>")
 
-    if unranked:
-        html.append("<h3 style='background-color:#95a5a6; color:white; padding:8px; border-radius:4px;'>❗ 測定不能（別路線）</h3>")
-        html.append(f"<p>{'、'.join([f'[{umaban_dict.get(u, '?')}] {u}' for u in unranked])}</p>")
+            # --- 隠れ馬ブロック ---
+            indirect_paths = []
+            for v in runners:
+                if u == v or G.has_edge(u, v): continue
+                for h in G.nodes():
+                    if h in runners: continue
+                    if G.has_edge(u, h) and G.has_edge(h, v):
+                        # 最新の対戦を採用
+                        uh_hist = G[u][h]['history'][0]
+                        hv_hist = G[h][v]['history'][0]
+                        tot_diff = uh_hist['raw_diff'] + hv_hist['raw_diff']
+                        
+                        rel = get_rel_str(tot_diff, 'C', is_banei)
+                        v_uma = umaban_dict.get(v, "?")
+                        
+                        c1 = f"{uh_hist['course'][0]}{uh_hist['distance']}"
+                        c2 = f"{hv_hist['course'][0]}{hv_hist['distance']}"
+                        
+                        indirect_paths.append(f"[{h}]本馬<span style='font-weight:bold;'>{rel}</span>[{v_uma}]{v}({tot_diff:+.1f})※{c1}/{c2}")
+            
+            if indirect_paths:
+                html.append(f"<div style='margin-left:10px; margin-top:6px; font-size:0.85em; font-weight:bold; color:#8e44ad;'>🔗 隠れ馬経由の比較:</div>")
+                for path in indirect_paths:
+                    html.append(f"<div style='margin-left:20px; font-size:0.85em;'>{path}</div>")
+            
+            html.append("</div>")
 
     html.append("</div>")
     return "".join(html)
@@ -451,7 +479,7 @@ function openTab(evt, id) {{
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇")
 
 st.title("🏇 競馬AI 究極相対評価 (ポイント勝負づけ版)")
-st.caption("全馬との対戦をポイント化し、「負けない馬（無敗ボーナス）」を的確にピックアップするプロ馬券師仕様のAIです。")
+st.caption("全馬との対戦をポイント化し、「負けない馬」を的確に上位ランクへ引き上げるプロ仕様のAIです。")
 
 url_input = st.text_input("netkeibaのレースURL", placeholder="https://race.netkeiba.com/race/result.html?race_id=202405020111")
 water_mode = st.selectbox("水分量フィルタ（ばんえい専用）", ["なし", "軽馬場（dry）", "重馬場（wet）"])
@@ -479,9 +507,9 @@ if submitted and url_input:
                 results.append((r, f"{r}R (出走なし)", "データなし"))
                 continue
                 
-            G = build_matchup_graph(past_races, t_course, t_dist, uma_dict, is_banei)
-            tier_map, matchups, ranked, unranked, undef_flags = evaluate_league(G, uma_dict)
-            html_out = build_html_output(tier_map, matchups, ranked, unranked, undef_flags, uma_dict, G)
+            G, history = build_matchup_graph(past_races, t_course, t_dist, uma_dict, is_banei)
+            tier_map, ranked, unranked = evaluate_league(G, history, uma_dict)
+            html_out = build_html_output(tier_map, ranked, unranked, uma_dict, history, G, is_banei)
             
             results.append((r, r_title, html_out))
         except Exception as e:
