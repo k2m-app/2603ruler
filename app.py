@@ -420,7 +420,6 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
                         raw_diff = h1_time - h2_time
                         _add_edge(h1_name, h2_name, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, False)
 
-    # 【重要変更】任意の2頭の対戦履歴（直接・間接問わず）を日付順にソートし、最新3戦のみに絞る
     for u, v, d in G.edges(data=True):
         d["history"].sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
         d["history"] = d["history"][:3] # 直近3走までで打ち切り
@@ -523,7 +522,6 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
 def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance):
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
     matchup_matrix = {u: {} for u in runners}
-    now = datetime.now()
 
     for u in runners:
         for v in runners:
@@ -544,26 +542,29 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             else:
                 draw_th, strong_th = 0.7, 1.2
 
+            # 【重要修正1】日付順にソートし、時系列に応じた重みを事前に付与
+            target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
+            for i, entry in enumerate(target_entries):
+                if i == 0:
+                    entry["weight"] = 1.0
+                elif i == 1:
+                    entry["weight"] = 0.9
+                else:
+                    entry["weight"] = 0.7
+
+            # 【重要修正2】本馬(u)にとってスコアが良かった（着差有利な）上位2走のみを採用し、大敗アウトライアーを除外
+            target_entries.sort(key=lambda x: x["diff"], reverse=True)
+            best_entries = target_entries[:2]
+
             wins = 0
             losses = 0
             weighted_sum = 0
             total_weight = 0
 
-            # 日付順にソート（グラフ側でもソート済みだが念のため）
-            target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
-            # 直近3走までに制限
-            target_entries = target_entries[:3]
-
-            for i, entry in enumerate(target_entries):
-                dt = entry["date"]
-                days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
-                months_ago = max(0, days_ago / 30.0)
-                
-                time_weight = max(0.2, 0.75 ** months_ago)
-                order_weight = 1.5 if i == 0 else (0.8 ** i) 
-                weight = time_weight * order_weight
-                
+            for entry in best_entries:
+                weight = entry["weight"]
                 d = entry["diff"]
+                
                 if d >= draw_th: wins += 1
                 elif d <= -draw_th: losses += 1
                 
@@ -574,9 +575,9 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
             if is_forgiven:
                 matchup_matrix[u][v] = "="
-            elif wins == len(target_entries) and wins > 0:
+            elif wins == len(best_entries) and wins > 0:
                 matchup_matrix[u][v] = ">>" if avg_diff >= strong_th else ">"
-            elif losses == len(target_entries) and losses > 0:
+            elif losses == len(best_entries) and losses > 0:
                 matchup_matrix[u][v] = "<<" if avg_diff <= -strong_th else "<"
             elif avg_diff >= draw_th:
                 matchup_matrix[u][v] = ">"
@@ -630,7 +631,6 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
                 if rel:
                     h_a, h_b = (u, v) if u < v else (v, u)
                     is_direct = G.has_edge(h_a, h_b)
-                    # 【改善策】隠れ馬のウェイトを0.5から1.0に引き上げ（直接対決は3.0）
                     weight = 3.0 if is_direct else 1.0 
 
                     count += weight
@@ -980,9 +980,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (直近3走厳格化・隠れ馬ウェイト再調整版)")
+st.title("🏇 競馬AI 究極相対評価 (大敗ノーカン・ポテンシャル特化版)")
 st.caption(
-    "【更新点】2頭間の直接対決・間接比較の履歴を完全に「直近3戦」に限定し、4走前以前の成績が評価や表示に混入しないよう修正。また、隠れ馬の評価ウェイトを引き上げました。"
+    "【更新点】過去の対戦履歴から「自身にとって最も有利だった上位2走」のみを抽出して勝敗を判定し、1回の大敗による不当なランク落ちを防止しました。また、時系列の重み付けを適正化（1.0倍, 0.9倍, 0.7倍）しています。"
 )
 
 url_input = st.text_input(
