@@ -273,16 +273,16 @@ def get_rel_str(diff, cond, is_banei=False):
 
 def calculate_matchup_points(rel, is_direct=True):
     """
-    keiba_bot.pyの重み付けを反映:
-      直接対決は weight=2.0、隠れ馬経由は weight=1.0
-      勝ち/負けの非対称スコア（穴馬救済のため負けを軽減）
+    対戦結果をポイントに変換。
+    勝ち負けは対称スコア、引き分けはゼロ。
+    直接対決は weight=2.0、隠れ馬経由は weight=1.0。
     """
     weight = 2.0 if is_direct else 1.0
     if rel == ">>":   return  3.0 * weight
-    elif rel == ">":  return  2.0 * weight
-    elif rel == "＝": return  1.0 * weight
-    elif rel == "<":  return -0.5 * weight   # 穴馬救済のためマイルド化
-    elif rel == "<<": return -1.0 * weight
+    elif rel == ">":  return  1.5 * weight
+    elif rel == "＝": return  0.0 * weight
+    elif rel == "<":  return -1.5 * weight
+    elif rel == "<<": return -3.0 * weight
     return 0.0
 
 
@@ -823,10 +823,10 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
 
                     count += weight
                     if rel == ">>":   pts += 3.0 * weight
-                    elif rel == ">":  pts += 2.0 * weight
-                    elif rel == "=":  pts += 1.0 * weight
-                    elif rel == "<":  pts -= 0.5 * weight
-                    elif rel == "<<": pts -= 1.0 * weight
+                    elif rel == ">":  pts += 1.5 * weight
+                    elif rel == "=":  pts += 0.0 * weight   # 引き分けはゼロ（旧版の+1.0が全馬S化の元凶）
+                    elif rel == "<":  pts -= 1.5 * weight   # 負けは勝ちと対称に
+                    elif rel == "<<": pts -= 3.0 * weight   # 圧敗も勝ちと対称に
 
             avg_pts = pts / count if count > 0 else 0
             horse_points[u] = avg_pts
@@ -835,53 +835,121 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
         top_score = ranked_pool[0][1] if ranked_pool else 0
 
         # --- トップからの相対差分でティア割り当て ---
-        for h, score in ranked_pool:
-            diff_from_top = top_score - score
-            if diff_from_top <= 0.4 and score > 0.5:
-                all_tiers[h] = "S"
-            elif diff_from_top <= 1.0 and score > 0.0:
-                all_tiers[h] = "A"
-            elif diff_from_top <= 2.5 and score > -0.5:
+        # スコアのレンジに応じて動的にティア境界を決定
+        bottom_score = ranked_pool[-1][1] if ranked_pool else 0
+        spread = top_score - bottom_score
+
+        if spread < 0.3:
+            # ほぼ全馬が同スコア → 全員Bランク（差がつけられない）
+            for h, score in ranked_pool:
                 all_tiers[h] = "B"
-            else:
-                all_tiers[h] = "C"
+        else:
+            # スプレッドを4分割してS/A/B/Cを割り当て
+            step = spread / 4.0
+            for h, score in ranked_pool:
+                diff_from_top = top_score - score
+                if diff_from_top <= step:
+                    all_tiers[h] = "S"
+                elif diff_from_top <= step * 2:
+                    all_tiers[h] = "A"
+                elif diff_from_top <= step * 3:
+                    all_tiers[h] = "B"
+                else:
+                    all_tiers[h] = "C"
 
-        # --- 直接対決結果との整合性補正（最大2回イテレーション）---
+        # --- 直接対決結果との整合性補正 ---
+        # 勝敗グラフのトポロジカル深度からティアを強制する。
+        # 三すくみ（循環）は検出してスキップし、同ランクを許容する。
+        
+        tier_list = ["S", "A", "B", "C"]
         rank_order = {"S": 4, "A": 3, "B": 2, "C": 1}
-        lower_tier_map = {"S": "A", "A": "B", "B": "C", "C": "C"}
-
-        for _ in range(2):
-            changed = False
-            for u in pool:
-                for v in pool:
-                    if u == v:
-                        continue
-                    rel = matchup_matrix[u].get(v)
-                    if not rel:
-                        continue
-                    t_u = all_tiers.get(u)
-                    t_v = all_tiers.get(v)
-                    if not t_u or not t_v:
-                        continue
-                    r_u = rank_order.get(t_u, 0)
-                    r_v = rank_order.get(t_v, 0)
-
-                    # 勝っているのに同ランクまたは下のランク → 敗者を1段下げる
-                    if rel in (">", ">>") and r_u <= r_v:
-                        new_tier = lower_tier_map[t_v]
-                        if all_tiers[v] != new_tier:
-                            all_tiers[v] = new_tier
-                            changed = True
-
-                    # 引き分けなのに違うランク → 低い方を高い方に合わせる
-                    if rel == "=" and r_u != r_v:
-                        higher_tier = t_u if r_u > r_v else t_v
-                        if all_tiers[u] != higher_tier or all_tiers[v] != higher_tier:
-                            all_tiers[u] = higher_tier
-                            all_tiers[v] = higher_tier
-                            changed = True
-            if not changed:
-                break
+        
+        # 1. 非循環の勝敗ペアを収集
+        win_edges = {}  # winner -> [losers]
+        for u in pool:
+            win_edges[u] = []
+            for v in pool:
+                if u == v:
+                    continue
+                rel = matchup_matrix[u].get(v)
+                if rel in (">", ">>"):
+                    rev = matchup_matrix[v].get(u)
+                    if rev in (">", ">>"):
+                        continue  # 三すくみはスキップ
+                    win_edges[u].append(v)
+        
+        # 2. 各馬の「最長敗北チェーン深度」を計算
+        #    例: A>B>C>D なら D=0, C=1, B=2, A=3
+        #    深度が大きいほど上位
+        depth_cache = {}
+        def get_win_depth(horse, visited=None):
+            if horse in depth_cache:
+                return depth_cache[horse]
+            if visited is None:
+                visited = set()
+            if horse in visited:
+                return 0  # 循環検出
+            visited.add(horse)
+            if not win_edges.get(horse):
+                depth_cache[horse] = 0
+                return 0
+            max_d = 0
+            for loser in win_edges[horse]:
+                d = get_win_depth(loser, visited.copy()) + 1
+                if d > max_d:
+                    max_d = d
+            depth_cache[horse] = max_d
+            return max_d
+        
+        for h in pool:
+            get_win_depth(h)
+        
+        # 3. 深度に基づいてティアを強制割り当て
+        #    深度3以上=S, 深度2=A, 深度1=B, 深度0=C
+        #    5段以上のチェーンは下の方が全てCに圧縮される（意図通り）
+        if depth_cache:
+            max_depth = max(depth_cache.values())
+            
+            if max_depth > 0:
+                # 深度→ティアのマッピング（上位3段だけ使い、残りは全てC）
+                depth_to_tier = {0: "C"}
+                if max_depth >= 1:
+                    depth_to_tier[1] = "B"
+                if max_depth >= 2:
+                    depth_to_tier[2] = "A"
+                # 深度3以上は全てS
+                
+                for h in pool:
+                    depth = depth_cache.get(h, 0)
+                    if depth >= 3:
+                        forced_tier = "S"
+                    else:
+                        forced_tier = depth_to_tier.get(depth, "C")
+                    
+                    # スコアベースのティアより深度ベースの方が低い場合のみ強制
+                    # （勝ちまくってる馬が深度の都合で下がるのは防ぐ）
+                    current_rank = rank_order.get(all_tiers[h], 0)
+                    forced_rank = rank_order.get(forced_tier, 0)
+                    
+                    # 深度ベースで上方修正（底突き救済）
+                    if forced_rank > current_rank:
+                        all_tiers[h] = forced_tier
+                
+                # 4. 最終検証: 勝者が敗者と同ランク以下なら敗者をCへ押し下げる
+                for _ in range(len(pool) * 2):
+                    changed = False
+                    for winner in pool:
+                        for loser in win_edges.get(winner, []):
+                            w_rank = rank_order.get(all_tiers[winner], 0)
+                            l_rank = rank_order.get(all_tiers[loser], 0)
+                            if w_rank <= l_rank:
+                                # 敗者を1段下げる（Cより下はないのでそこで止まる）
+                                l_idx = tier_list.index(all_tiers[loser])
+                                if l_idx < len(tier_list) - 1:
+                                    all_tiers[loser] = tier_list[l_idx + 1]
+                                    changed = True
+                    if not changed:
+                        break
 
     # --- ランキングリスト構築 ---
     tier_map = {}
