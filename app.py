@@ -34,7 +34,7 @@ def parse_date(date_str):
 
 
 # ==========================================
-# 1. コース形態判定（keiba_bot.py準拠の精密版）
+# 1. コース形態判定（精密版）
 # ==========================================
 def _is_ooi_inner(dist):
     d = int(dist) if str(dist).isdigit() else 0
@@ -455,30 +455,28 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
         if not h_list:
             continue
 
-        # 今回出走馬同士の直接対決
         current_in_race = [(h, t) for h, t in h_list if h in current_names]
         if len(current_in_race) >= 2:
             for i in range(len(current_in_race)):
                 for j in range(i + 1, len(current_in_race)):
                     h1, t1 = current_in_race[i]
                     h2, t2 = current_in_race[j]
-                    raw_diff = t1 - t2 # 修正：勝ち馬補正を撤廃
+                    raw_diff = t1 - t2 
                     _add_edge(h1, h2, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, True)
 
-        # 隠れ馬とのエッジ
         if not is_direct_only:
             hidden_horses = [(h, t) for h, t in h_list if h not in current_names]
             if current_in_race and hidden_horses:
                 for curr_name, curr_time in current_in_race:
                     for hid_name, hid_time in hidden_horses:
-                        raw_diff = curr_time - hid_time # 修正：勝ち馬補正を撤廃
+                        raw_diff = curr_time - hid_time
                         _add_edge(curr_name, hid_name, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, False)
 
                 for i in range(len(hidden_horses)):
                     for j in range(i + 1, len(hidden_horses)):
                         h1_name, h1_time = hidden_horses[i]
                         h2_name, h2_time = hidden_horses[j]
-                        raw_diff = h1_time - h2_time # 修正：勝ち馬補正を撤廃
+                        raw_diff = h1_time - h2_time
                         _add_edge(h1_name, h2_name, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, False)
 
     return G
@@ -604,13 +602,12 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             else:
                 draw_th, strong_th = 0.7, 1.2
 
-            # 修正：時間経過による減衰係数（鮮度重み付け）
+            # 時間経過による減衰係数（鮮度重み付け）
             adj_diffs = []
             for entry in target_entries:
                 dt = entry["date"]
                 days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
                 months_ago = max(0, days_ago / 30.0)
-                # 1ヶ月ごとに0.9倍（最大0.4倍まで減衰）
                 weight = max(0.4, 0.9 ** months_ago)
                 adj_diff = entry["diff"] * weight
                 adj_diffs.append(adj_diff)
@@ -636,7 +633,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
 
 # ==========================================
-# 5. ティア判定
+# 5. ティア判定（DAGベースのトポロジカルソート）
 # ==========================================
 def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
@@ -667,147 +664,73 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     pool = list(comparable_horses)
 
     if pool:
-        horse_points = {}
+        # 1. 勝敗（> と >>）だけで有向グラフを作成（「＝」は含めない）
+        DG = nx.DiGraph()
         for u in pool:
-            pts = 0.0
-            count = 0
-            for v in pool:
-                if u == v: continue
-                rel = matchup_matrix[u].get(v)
-                if rel:
-                    h_a, h_b = (u, v) if u < v else (v, u)
-                    is_direct = G.has_edge(h_a, h_b)
-                    weight = 2.0 if is_direct else 1.0
-
-                    count += weight
-                    if rel == ">>":   pts += 3.0 * weight
-                    elif rel == ">":  pts += 1.5 * weight
-                    elif rel == "=":  pts += 0.0 * weight
-                    elif rel == "<":  pts -= 1.5 * weight
-                    elif rel == "<<": pts -= 3.0 * weight
-
-            avg_pts = pts / count if count > 0 else 0
-            horse_points[u] = avg_pts
-
-        horse_stats = {}
+            DG.add_node(u)
+            
         for u in pool:
-            wins = 0
-            losses = 0
-            dominations = 0
-            total = 0
             for v in pool:
                 if u == v: continue
                 rel = matchup_matrix[u].get(v)
                 if not rel: continue
-                total += 1
-                if rel in (">", ">>"): wins += 1
-                if rel == ">>": dominations += 1
-                if rel in ("<", "<<"): losses += 1
+                
+                # u > v (uの方が強い) なら、v から u へエッジ（下位から上位へのパス）
+                if rel == ">>":
+                    DG.add_edge(v, u, weight=2)
+                elif rel == ">":
+                    DG.add_edge(v, u, weight=1)
+                        
+        # 2. 真の三すくみ(A>B>C>A)のみを縮約してDAG化
+        cg = nx.condensation(DG)
+        
+        # 3. 各グループのベースレベル（最長パス）を計算
+        scc_levels = {n: 0 for n in cg.nodes()}
+        for n in nx.topological_sort(cg):
+            for succ in cg.successors(n):
+                members_n = cg.nodes[n]['members']
+                members_succ = cg.nodes[succ]['members']
+                
+                weights = [DG[u][v]['weight'] for u in members_n for v in members_succ if DG.has_edge(u, v)]
+                max_w = max(weights) if weights else 1
+                
+                if scc_levels[n] + max_w > scc_levels[succ]:
+                    scc_levels[succ] = scc_levels[n] + max_w
+                    
+        horse_levels = {}
+        for n, lvl in scc_levels.items():
+            for horse in cg.nodes[n]['members']:
+                horse_levels[horse] = lvl
 
-            win_rate = wins / total if total > 0 else 0.0
-            loss_rate = losses / total if total > 0 else 0.0
-            dom_rate = dominations / total if total > 0 else 0.0
-
-            pts_component = horse_points.get(u, 0)
-            winrate_component = (win_rate - loss_rate) * 3.0
-            dom_component = dom_rate * 3.0
-
-            combined = pts_component * 0.5 + winrate_component * 0.3 + dom_component * 0.2
-
-            horse_stats[u] = {
-                "combined": combined,
-                "wins": wins, "losses": losses, "dominations": dominations,
-                "total": total, "win_rate": win_rate, "dom_rate": dom_rate
-            }
-
-        ranked_pool = sorted(horse_stats.items(), key=lambda x: x[1]["combined"], reverse=True)
-        top_score = ranked_pool[0][1]["combined"] if ranked_pool else 0
-        bottom_score = ranked_pool[-1][1]["combined"] if ranked_pool else 0
-        spread = top_score - bottom_score
-
-        if spread < 0.3:
-            for h, stats in ranked_pool:
-                all_tiers[h] = "B"
-        else:
-            step = spread / 4.0
-            for h, stats in ranked_pool:
-                diff_from_top = top_score - stats["combined"]
-                if diff_from_top <= step: all_tiers[h] = "S"
-                elif diff_from_top <= step * 2: all_tiers[h] = "A"
-                elif diff_from_top <= step * 3: all_tiers[h] = "B"
-                else: all_tiers[h] = "C"
-
-        for h in pool:
-            stats = horse_stats.get(h, {})
-            doms = stats.get("dominations", 0)
-            current_tier = all_tiers.get(h)
-            if doms >= 3 and current_tier in ("B", "C"):
-                all_tiers[h] = "A"
-            elif doms >= 2 and current_tier == "C":
-                all_tiers[h] = "B"
-
-        # 修正：階層による過剰なSランク付与を抑制（底突き救済）
-        win_edges = {}
+        # 4. 「＝」の同格関係による引き上げ補正（無限連鎖を防ぐため1回だけ）
+        level_updates = horse_levels.copy()
         for u in pool:
-            win_edges[u] = []
             for v in pool:
                 if u == v: continue
-                rel = matchup_matrix[u].get(v)
-                if rel in (">", ">>"):
-                    rev = matchup_matrix[v].get(u)
-                    if rev in (">", ">>"): continue
-                    win_edges[u].append(v)
+                if matchup_matrix[u].get(v) == "=":
+                    # 同格なのにレベル差がついている場合、低い方を「高い方 - 1.0(1ランク下)」まで引き上げる
+                    max_lvl = max(horse_levels[u], horse_levels[v])
+                    if horse_levels[u] < max_lvl:
+                        level_updates[u] = max(level_updates[u], max_lvl - 1.0)
+                    if horse_levels[v] < max_lvl:
+                        level_updates[v] = max(level_updates[v], max_lvl - 1.0)
+                        
+        horse_levels = level_updates
 
-        depth_cache = {}
-        def get_win_depth(horse, visited=None):
-            if horse in depth_cache: return depth_cache[horse]
-            if visited is None: visited = set()
-            if horse in visited: return 0
-            visited.add(horse)
-            if not win_edges.get(horse):
-                depth_cache[horse] = 0
-                return 0
-            max_d = 0
-            for loser in win_edges[horse]:
-                d = get_win_depth(loser, visited.copy()) + 1
-                if d > max_d: max_d = d
-            depth_cache[horse] = max_d
-            return max_d
-
-        for h in pool:
-            get_win_depth(h)
-
-        if depth_cache:
-            max_depth = max(depth_cache.values())
-            if max_depth > 0:
-                depth_to_tier = {0: "C"}
-                if max_depth >= 1: depth_to_tier[1] = "C" # 1段はCのまま
-                if max_depth >= 2: depth_to_tier[2] = "B" # 2段でBへ底上げ
-                if max_depth >= 3: depth_to_tier[3] = "A" # 3段以上でもA止まり（Sにはしない）
-
-                rank_order = {"S": 4, "A": 3, "B": 2, "C": 1}
-                for h in pool:
-                    depth = depth_cache.get(h, 0)
-                    forced_tier = "A" if depth >= 3 else depth_to_tier.get(depth, "C")
-                    
-                    current_rank = rank_order.get(all_tiers[h], 0)
-                    forced_rank = rank_order.get(forced_tier, 0)
-                    if forced_rank > current_rank:
-                        all_tiers[h] = forced_tier
-
-                tier_list = ["S", "A", "B", "C"]
-                for _ in range(len(pool) * 2):
-                    changed = False
-                    for winner in pool:
-                        for loser in win_edges.get(winner, []):
-                            w_rank = rank_order.get(all_tiers[winner], 0)
-                            l_rank = rank_order.get(all_tiers[loser], 0)
-                            if w_rank <= l_rank:
-                                l_idx = tier_list.index(all_tiers[loser])
-                                if l_idx < len(tier_list) - 1:
-                                    all_tiers[loser] = tier_list[l_idx + 1]
-                                    changed = True
-                    if not changed: break
+        # 5. ランク割り当て（インフレを防ぐため幅を持たせる）
+        max_level = max(horse_levels.values()) if horse_levels else 0
+        
+        for h, lvl in horse_levels.items():
+            diff = max_level - lvl
+            
+            if diff <= 0.5:
+                all_tiers[h] = "S"
+            elif diff <= 1.5:  # 「>」 1つ分の差まで
+                all_tiers[h] = "A"
+            elif diff <= 3.0:  # 「>>」 1つ分、または「>」 2〜3つ分の差
+                all_tiers[h] = "B"
+            else:
+                all_tiers[h] = "C"
 
     tier_map = {}
     ranked = []
@@ -1072,7 +995,7 @@ def analyze_race(scraper, race_id, water_mode=None):
         # 3. 対戦マトリクス
         matchup_matrix = compute_matchup_matrix(pair_net, runners, G, t_course, t_dist)
 
-        # 4. ティア判定
+        # 4. ティア判定 (DAG + Topological Sort)
         tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, G, uma_dict, is_banei)
 
         # 5. HTML出力
@@ -1089,10 +1012,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (減衰調整・精度向上版)")
+st.title("🏇 競馬AI 究極相対評価 (DAGトポロジカルソート実装版)")
 st.caption(
-    "【更新点】勝ち馬への+0.3秒過剰補正を撤廃 / 過去の着差は1ヶ月経過で0.9倍ずつ価値を減衰（鮮度の反映） / "
-    "NetworkXグラフ探索での「勝ち抜け」による過剰なSランク付与を是正"
+    "【更新点】相対評価ロジックにNetworkXを用いたDAG（有向非巡回グラフ）縮約とトポロジカルソートを実装。三すくみなどの循環参照に強くなり、適切なランク付けを行います。"
 )
 
 url_input = st.text_input(
