@@ -522,69 +522,107 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
 def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance):
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
     matchup_matrix = {u: {} for u in runners}
+    now = datetime.now()
 
-    for u in runners:
-        for v in runners:
-            if u == v or not pair_net[u][v]:
+    def inverse_sym(s):
+        if s == ">>": return "<<"
+        if s == ">": return "<"
+        if s == "=": return "="
+        if s == "<": return ">"
+        if s == "<<": return ">>"
+        return "="
+
+    for i, u in enumerate(runners):
+        for j, v in enumerate(runners):
+            if i >= j: continue # 完全対称処理のため半分だけ計算
+
+            entries_u = pair_net[u].get(v, [])
+            if not entries_u:
                 continue
 
-            best_is_strict = any(entry["is_strict"] for entry in pair_net[u][v])
-            target_entries = [entry for entry in pair_net[u][v] if entry["is_strict"] == best_is_strict]
+            best_is_strict = any(entry["is_strict"] for entry in entries_u)
+            target_entries = [entry for entry in entries_u if entry["is_strict"] == best_is_strict]
+            if not target_entries:
+                continue
 
-            is_forgiven = False
+            is_forgiven_u = False
+            is_forgiven_v = False
             if target_course == "大井" and _is_ooi_outer(cur_dist):
-                for entry in pair_net[u][v]:
-                    if entry["place"] == "大井" and _is_ooi_inner(entry["dist"]) and entry["diff"] < 0:
-                        is_forgiven = True
+                for entry in target_entries:
+                    if entry["place"] == "大井" and _is_ooi_inner(entry["dist"]):
+                        if entry["diff"] < 0: is_forgiven_u = True
+                        if -entry["diff"] < 0: is_forgiven_v = True
 
-            if best_is_strict:
-                draw_th, strong_th = 0.5, 1.0
-            else:
-                draw_th, strong_th = 0.7, 1.2
+            draw_th, strong_th = (0.5, 1.0) if best_is_strict else (0.7, 1.2)
 
-            # 【重要修正1】日付順にソートし、時系列に応じた重みを事前に付与
+            # 日付順ソート＆直近3戦のみ抽出
             target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
-            for i, entry in enumerate(target_entries):
-                if i == 0:
-                    entry["weight"] = 1.0
-                elif i == 1:
-                    entry["weight"] = 0.9
-                else:
-                    entry["weight"] = 0.7
+            target_entries = target_entries[:3]
 
-            # 【重要修正2】本馬(u)にとってスコアが良かった（着差有利な）上位2走のみを採用し、大敗アウトライアーを除外
-            target_entries.sort(key=lambda x: x["diff"], reverse=True)
-            best_entries = target_entries[:2]
+            # 時系列ウェイトの付与（1.0, 0.9, 0.7）
+            for k, entry in enumerate(target_entries):
+                if k == 0: entry["weight"] = 1.0
+                elif k == 1: entry["weight"] = 0.9
+                else: entry["weight"] = 0.7
 
-            wins = 0
-            losses = 0
-            weighted_sum = 0
-            total_weight = 0
-
-            for entry in best_entries:
-                weight = entry["weight"]
-                d = entry["diff"]
+            def get_sym(entries, sign=1.0):
+                if not entries: return "="
+                wins = losses = weighted_sum = total_weight = 0
+                for entry in entries:
+                    dt = entry["date"]
+                    days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
+                    months_ago = max(0, days_ago / 30.0)
+                    time_weight = max(0.2, 0.75 ** months_ago)
+                    w = entry["weight"] * time_weight
+                    
+                    d = entry["diff"] * sign
+                    if d >= draw_th: wins += 1
+                    elif d <= -draw_th: losses += 1
+                    
+                    weighted_sum += d * w
+                    total_weight += w
+                    
+                avg = weighted_sum / total_weight if total_weight > 0 else 0
                 
-                if d >= draw_th: wins += 1
-                elif d <= -draw_th: losses += 1
-                
-                weighted_sum += d * weight
-                total_weight += weight
+                if wins == len(entries) and wins > 0:
+                    return ">>" if avg >= strong_th else ">"
+                if losses == len(entries) and losses > 0:
+                    return "<<" if avg <= -strong_th else "<"
+                if avg >= draw_th: return ">"
+                if avg <= -draw_th: return "<"
+                return "="
 
-            avg_diff = weighted_sum / total_weight if total_weight > 0 else 0
+            # 1. 全レースの平均評価
+            sym_all_u = get_sym(target_entries, sign=1.0)
+            
+            # 2. U視点での上位2レースの評価
+            sorted_for_u = sorted(target_entries, key=lambda x: x["diff"], reverse=True)
+            sym_best2_u = get_sym(sorted_for_u[:2], sign=1.0)
+            
+            # 3. V視点での上位2レースの評価
+            sorted_for_v = sorted(target_entries, key=lambda x: x["diff"])
+            sym_best2_v = get_sym(sorted_for_v[:2], sign=-1.0)
 
-            if is_forgiven:
-                matchup_matrix[u][v] = "="
-            elif wins == len(best_entries) and wins > 0:
-                matchup_matrix[u][v] = ">>" if avg_diff >= strong_th else ">"
-            elif losses == len(best_entries) and losses > 0:
-                matchup_matrix[u][v] = "<<" if avg_diff <= -strong_th else "<"
-            elif avg_diff >= draw_th:
-                matchup_matrix[u][v] = ">"
-            elif avg_diff <= -draw_th:
-                matchup_matrix[u][v] = "<"
+            # 【重要】アウトライアー救済条件
+            # 「全平均では『負け（＜）』だが、上位2走を取れば『勝ち（＞）』になる」場合のみ救済し、
+            # 単なる「＝」を過剰に「＞」へ引き上げることはしない。
+            rescue_u = (sym_all_u in ["<", "<<"] and sym_best2_u in [">", ">>"])
+            
+            sym_all_v = inverse_sym(sym_all_u)
+            rescue_v = (sym_all_v in ["<", "<<"] and sym_best2_v in [">", ">>"])
+
+            if rescue_u:
+                final_sym_u = sym_best2_u
+            elif rescue_v:
+                final_sym_u = inverse_sym(sym_best2_v)
             else:
-                matchup_matrix[u][v] = "="
+                final_sym_u = sym_all_u
+
+            if is_forgiven_u and final_sym_u in ["<", "<<"]: final_sym_u = "="
+            if is_forgiven_v and final_sym_u in [">", ">>"]: final_sym_u = "="
+
+            matchup_matrix[u][v] = final_sym_u
+            matchup_matrix[v][u] = inverse_sym(final_sym_u)
 
     return matchup_matrix
 
@@ -980,9 +1018,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (大敗ノーカン・ポテンシャル特化版)")
+st.title("🏇 競馬AI 究極相対評価 (穴馬ポテンシャル最適化版)")
 st.caption(
-    "【更新点】過去の対戦履歴から「自身にとって最も有利だった上位2走」のみを抽出して勝敗を判定し、1回の大敗による不当なランク落ちを防止しました。また、時系列の重み付けを適正化（1.0倍, 0.9倍, 0.7倍）しています。"
+    "【更新点】全走平均では「負け（＜）」の馬が、上位2走平均なら「勝ち（＞）」に逆転する場合のみ大敗ノーカンとする条件付き救済を実装。また、直近3走の重みを「1.0倍, 0.9倍, 0.7倍」に平準化しました。"
 )
 
 url_input = st.text_input(
