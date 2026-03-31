@@ -335,7 +335,9 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
             h1_name, h2_name = h2_name, h1_name
             raw_diff = -raw_diff
 
-        capped_diff = max(-1.5, min(1.5, raw_diff))
+        # 【改善策2】負け（-側）の大敗ノイズを-1.0でカット（非対称クリップ）
+        # ※勝ちは実力だが、負けは諦め・不利が多いため
+        capped_diff = max(-1.0, min(1.5, raw_diff))
         r_dist_int = int(r_dist_str) if str(r_dist_str).isdigit() else 0
         dist_diff_val = abs(r_dist_int - cur_dist) if r_dist_int > 0 and cur_dist > 0 else 9999
 
@@ -455,7 +457,6 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
                     for d, dt, p, dist in same_cond:
                         pair_net[u][v].append({"diff": d, "is_strict": True, "place": p, "dist": dist, "date": dt})
 
-                # 【重要修正】別条件レース（other_cond）が除外されたり、0.4倍に割引されるバグを撤廃
                 if other_cond:
                     for d, dt, p, dist in other_cond:
                         pair_net[u][v].append({"diff": d, "is_strict": False, "place": p, "dist": dist, "date": dt})
@@ -543,14 +544,21 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             weighted_sum = 0
             total_weight = 0
 
-            for entry in target_entries:
+            # 【改善策1】日付順にソートし、最新の対決を圧倒的に重視（Time & Order Decay）
+            target_entries.sort(key=lambda x: x["date"], reverse=True)
+
+            for i, entry in enumerate(target_entries):
                 dt = entry["date"]
                 days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
                 months_ago = max(0, days_ago / 30.0)
-                weight = max(0.6, 0.95 ** months_ago)
+                
+                # 時間経過による急激な減衰（0.75倍/月）
+                time_weight = max(0.2, 0.75 ** months_ago)
+                # 複数回対戦がある場合、最新のレース(i=0)に1.5倍のボーナス。過去のレースは割引。
+                order_weight = 1.5 if i == 0 else (0.8 ** i) 
+                weight = time_weight * order_weight
                 
                 d = entry["diff"]
-                # 生の着差で勝敗を判定（減衰の影響で勝利が引き分けに降格するのを防ぐ）
                 if d >= draw_th: wins += 1
                 elif d <= -draw_th: losses += 1
                 
@@ -565,9 +573,9 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                 matchup_matrix[u][v] = ">>" if avg_diff >= strong_th else ">"
             elif losses == len(target_entries) and losses > 0:
                 matchup_matrix[u][v] = "<<" if avg_diff <= -strong_th else "<"
-            elif wins > losses:
+            elif avg_diff >= draw_th: # 加重平均による最終判定を追加
                 matchup_matrix[u][v] = ">"
-            elif losses > wins:
+            elif avg_diff <= -draw_th:
                 matchup_matrix[u][v] = "<"
             else:
                 matchup_matrix[u][v] = "="
@@ -576,7 +584,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
 
 # ==========================================
-# 5. ティア判定（勝率・ポイントベースの絶対スコア方式へ回帰）
+# 5. ティア判定（勝率・ポイントベースの絶対スコア方式）
 # ==========================================
 def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
@@ -617,7 +625,8 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
                 if rel:
                     h_a, h_b = (u, v) if u < v else (v, u)
                     is_direct = G.has_edge(h_a, h_b)
-                    weight = 2.0 if is_direct else 1.0
+                    # 【改善策3】直接対決の信頼度を上げ、間接比較（隠れ馬経由）の影響力を下げる
+                    weight = 3.0 if is_direct else 0.5 
 
                     count += weight
                     if rel == ">>":   pts += 3.0 * weight
@@ -652,7 +661,7 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             winrate_component = (win_rate - loss_rate) * 3.0
             dom_component = dom_rate * 3.0
 
-            # 総合スコア（独立路線でも不当に評価が下がらない）
+            # 総合スコア
             combined = pts_component * 0.5 + winrate_component * 0.3 + dom_component * 0.2
 
             horse_stats[u] = {
@@ -953,7 +962,7 @@ def analyze_race(scraper, race_id, water_mode=None):
         # 3. 対戦マトリクス
         matchup_matrix = compute_matchup_matrix(pair_net, runners, G, t_course, t_dist)
 
-        # 4. ティア判定 (勝率スコア方式)
+        # 4. ティア判定 (最新対決重視の絶対スコア方式)
         tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, G, uma_dict, is_banei)
 
         # 5. HTML出力
@@ -970,9 +979,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (最適化版)")
+st.title("🏇 競馬AI 究極相対評価 (近走逆転対応版)")
 st.caption(
-    "【更新点】別条件レース（other_cond）が0.4倍に割引かれて評価から消滅していた重大なバグを修正。さらに、独立路線の強豪馬が過小評価されるDAGアルゴリズムを廃止し、勝率と打点のハイブリッドによる「絶対スコア方式」に再構築しました。"
+    "【更新点】同一馬同士の複数回対戦において、「最新のレース結果」を1.5倍に重み付けし、古い借金で不当に評価が下がる現象を解消。また大差負けの影響を-1.0で打ち止めるノーカン処理を追加しました。"
 )
 
 url_input = st.text_input(
