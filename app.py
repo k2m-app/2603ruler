@@ -455,14 +455,10 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
                     for d, dt, p, dist in same_cond:
                         pair_net[u][v].append({"diff": d, "is_strict": True, "place": p, "dist": dist, "date": dt})
 
+                # 【重要修正】別条件レース（other_cond）が除外されたり、0.4倍に割引されるバグを撤廃
                 if other_cond:
-                    max_other_item = max(other_cond, key=lambda x: x[0])
-                    max_other = max_other_item[0]
-                    if max_other > 1.0:
-                        pair_net[u][v].append({"diff": max_other * 0.4, "is_strict": False, "place": max_other_item[2], "dist": max_other_item[3], "date": max_other_item[1]})
-                else:
-                    for oc in other_cond:
-                        pair_net[u][v].append({"diff": oc[0], "is_strict": False, "place": oc[2], "dist": oc[3], "date": oc[1]})
+                    for d, dt, p, dist in other_cond:
+                        pair_net[u][v].append({"diff": d, "is_strict": False, "place": p, "dist": dist, "date": dt})
 
                 if pair_net[u][v]:
                     continue
@@ -542,8 +538,6 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             else:
                 draw_th, strong_th = 0.7, 1.2
 
-            # 【修正点】「勝敗のカウント」には減衰前の生データを使用し、
-            # 「着差の平均」のみ時間経過で減衰させます（過去の勝利が消滅するのを防ぐため）
             wins = 0
             losses = 0
             weighted_sum = 0
@@ -553,10 +547,10 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                 dt = entry["date"]
                 days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
                 months_ago = max(0, days_ago / 30.0)
-                weight = max(0.6, 0.95 ** months_ago) # 緩やかな減衰
+                weight = max(0.6, 0.95 ** months_ago)
                 
                 d = entry["diff"]
-                # 生の着差で勝敗を判定
+                # 生の着差で勝敗を判定（減衰の影響で勝利が引き分けに降格するのを防ぐ）
                 if d >= draw_th: wins += 1
                 elif d <= -draw_th: losses += 1
                 
@@ -582,7 +576,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
 
 # ==========================================
-# 5. ティア判定（DAGベースのトポロジカルソート）
+# 5. ティア判定（勝率・ポイントベースの絶対スコア方式へ回帰）
 # ==========================================
 def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
@@ -605,7 +599,7 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
         compared_count = sum(1 for v in runners if u != v and len(pair_net[u][v]) > 0)
         coverage = compared_count / total_opponents if total_opponents > 0 else 0
         if coverage < COVERAGE_THRESHOLD:
-            has_strong_win = any(matchup_matrix[u].get(v) == ">>" for v in runners)
+            has_strong_win = any(matchup_matrix[u].get(v) in (">", ">>") for v in runners)
             if not has_strong_win:
                 all_tiers[u] = None
                 comparable_horses.discard(u)
@@ -613,59 +607,88 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     pool = list(comparable_horses)
 
     if pool:
-        # 勝敗のみで有向グラフを作成（uがvに勝った場合、v -> u にエッジを張る）
-        DG = nx.DiGraph()
+        horse_points = {}
         for u in pool:
-            DG.add_node(u)
-            
+            pts = 0.0
+            count = 0
+            for v in pool:
+                if u == v: continue
+                rel = matchup_matrix[u].get(v)
+                if rel:
+                    h_a, h_b = (u, v) if u < v else (v, u)
+                    is_direct = G.has_edge(h_a, h_b)
+                    weight = 2.0 if is_direct else 1.0
+
+                    count += weight
+                    if rel == ">>":   pts += 3.0 * weight
+                    elif rel == ">":  pts += 1.5 * weight
+                    elif rel == "=":  pts += 0.0 * weight
+                    elif rel == "<":  pts -= 1.5 * weight
+                    elif rel == "<<": pts -= 3.0 * weight
+
+            avg_pts = pts / count if count > 0 else 0
+            horse_points[u] = avg_pts
+
+        horse_stats = {}
         for u in pool:
+            wins = 0
+            losses = 0
+            dominations = 0
+            total = 0
             for v in pool:
                 if u == v: continue
                 rel = matchup_matrix[u].get(v)
                 if not rel: continue
-                
-                # uが勝者(>)なら、敗者vから勝者uへのパスを作成
-                if rel == ">>":
-                    DG.add_edge(v, u, weight=2)
-                elif rel == ">":
-                    DG.add_edge(v, u, weight=1)
-                        
-        # 循環（三すくみ）の縮約
-        cg = nx.condensation(DG)
-        
-        # トポロジカルソートで最長パスを計算し、下層から上層へレベルを上げる
-        scc_levels = {n: 0 for n in cg.nodes()}
-        for n in nx.topological_sort(cg):
-            for succ in cg.successors(n):
-                members_n = cg.nodes[n]['members']
-                members_succ = cg.nodes[succ]['members']
-                weights = [DG[u][v]['weight'] for u in members_n for v in members_succ if DG.has_edge(u, v)]
-                max_w = max(weights) if weights else 1
-                
-                if scc_levels[n] + max_w > scc_levels[succ]:
-                    scc_levels[succ] = scc_levels[n] + max_w
-                    
-        horse_levels = {}
-        for n, lvl in scc_levels.items():
-            for horse in cg.nodes[n]['members']:
-                horse_levels[horse] = lvl
+                total += 1
+                if rel in (">", ">>"): wins += 1
+                if rel == ">>": dominations += 1
+                if rel in ("<", "<<"): losses += 1
 
-        # 【修正点】「＝（引き分け）」による曖昧なランク引き上げ処理を撤廃し、
-        # 純粋な勝敗グラフの長さにのみ基づいてランクを決定する
+            win_rate = wins / total if total > 0 else 0.0
+            loss_rate = losses / total if total > 0 else 0.0
+            dom_rate = dominations / total if total > 0 else 0.0
 
-        max_level = max(horse_levels.values()) if horse_levels else 0
-        
-        for h, lvl in horse_levels.items():
-            diff = max_level - lvl
-            
-            if diff <= 0.5:
-                all_tiers[h] = "S"
-            elif diff <= 1.5:
-                all_tiers[h] = "A"
-            elif diff <= 3.0:
+            pts_component = horse_points.get(u, 0)
+            winrate_component = (win_rate - loss_rate) * 3.0
+            dom_component = dom_rate * 3.0
+
+            # 総合スコア（独立路線でも不当に評価が下がらない）
+            combined = pts_component * 0.5 + winrate_component * 0.3 + dom_component * 0.2
+
+            horse_stats[u] = {
+                "combined": combined,
+                "wins": wins, "losses": losses, "dominations": dominations,
+                "total": total, "win_rate": win_rate, "dom_rate": dom_rate
+            }
+
+        # スコア順にソート
+        ranked_pool = sorted(horse_stats.items(), key=lambda x: x[1]["combined"], reverse=True)
+        top_score = ranked_pool[0][1]["combined"] if ranked_pool else 0
+        bottom_score = ranked_pool[-1][1]["combined"] if ranked_pool else 0
+        spread = top_score - bottom_score
+
+        # スプレッド（スコア差）に応じてランク付け
+        if spread < 0.3:
+            for h, stats in ranked_pool:
                 all_tiers[h] = "B"
-            else:
-                all_tiers[h] = "C"
+        else:
+            step = spread / 4.0
+            for h, stats in ranked_pool:
+                diff_from_top = top_score - stats["combined"]
+                if diff_from_top <= step: all_tiers[h] = "S"
+                elif diff_from_top <= step * 2: all_tiers[h] = "A"
+                elif diff_from_top <= step * 3: all_tiers[h] = "B"
+                else: all_tiers[h] = "C"
+
+        # 特例：圧勝（>>）が複数ある馬は底上げ
+        for h in pool:
+            stats = horse_stats.get(h, {})
+            doms = stats.get("dominations", 0)
+            current_tier = all_tiers.get(h)
+            if doms >= 3 and current_tier in ("B", "C"):
+                all_tiers[h] = "A"
+            elif doms >= 2 and current_tier == "C":
+                all_tiers[h] = "B"
 
     tier_map = {}
     ranked = []
@@ -930,7 +953,7 @@ def analyze_race(scraper, race_id, water_mode=None):
         # 3. 対戦マトリクス
         matchup_matrix = compute_matchup_matrix(pair_net, runners, G, t_course, t_dist)
 
-        # 4. ティア判定
+        # 4. ティア判定 (勝率スコア方式)
         tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, G, uma_dict, is_banei)
 
         # 5. HTML出力
@@ -947,9 +970,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (バグ修正版)")
+st.title("🏇 競馬AI 究極相対評価 (最適化版)")
 st.caption(
-    "【更新点】過去の生データに基づく厳格な勝敗判定、および引き分け等による過剰なランク上昇バグを修正。日付も綺麗に表示されるようにしました。"
+    "【更新点】別条件レース（other_cond）が0.4倍に割引かれて評価から消滅していた重大なバグを修正。さらに、独立路線の強豪馬が過小評価されるDAGアルゴリズムを廃止し、勝率と打点のハイブリッドによる「絶対スコア方式」に再構築しました。"
 )
 
 url_input = st.text_input(
