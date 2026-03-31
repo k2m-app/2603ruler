@@ -3,7 +3,6 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import re
-import statistics
 from datetime import datetime
 import networkx as nx
 
@@ -34,7 +33,7 @@ def parse_date(date_str):
 
 
 # ==========================================
-# 1. コース形態判定（精密版）
+# 1. コース形態判定
 # ==========================================
 def _is_ooi_inner(dist):
     d = int(dist) if str(dist).isdigit() else 0
@@ -45,12 +44,7 @@ def _is_ooi_outer(dist):
     return d > 0 and d not in [1500, 1600, 1650]
 
 def _is_one_turn(place, dist):
-    """
-    コーナー2回以下のワンターンコースを定義。
-    JRA全10場 + 地方全場対応。
-    """
     d = int(dist) if str(dist).isdigit() else 0
-
     if place in ("札幌", "函館"): return False
     if place == "福島" and d <= 1200: return True
     if place == "新潟" and d <= 1200: return True
@@ -60,24 +54,17 @@ def _is_one_turn(place, dist):
     if place == "京都" and d <= 1400: return True
     if place == "阪神" and d <= 1400: return True
     if place == "小倉" and d <= 1200: return True
-
     if place == "川崎" and d == 900: return True
     if place == "浦和" and d == 800: return True
     if place == "船橋" and d in [1000, 1200]: return True
     if place == "大井" and d in [1000, 1200, 1400]: return True
-
     if place == "門別" and d <= 1000: return True
     if place == "盛岡" and d <= 1000: return True
     if place in ("水沢","金沢","笠松","名古屋","園田","姫路","高知","佐賀"): return False
-
     return False
 
 def _get_track_layout(place, dist):
-    """
-    競馬場×距離 → コースレイアウト識別子を返す。
-    """
     d = int(dist) if str(dist).isdigit() else 0
-
     if place == "阪神":
         if d <= 1400: return "inner_short"
         if d in [1600, 1800]: return "outer_mid"
@@ -85,7 +72,6 @@ def _get_track_layout(place, dist):
         if d == 2200: return "inner_long"
         if d >= 2400: return "outer_long"
         return "inner_mid"
-
     if place == "京都":
         if d <= 1400: return "inner_short"
         if d == 1600: return "either_mid"
@@ -94,14 +80,12 @@ def _get_track_layout(place, dist):
         if d in [2200, 2400]: return "outer_long"
         if d >= 2600: return "outer_very_long"
         return "inner_mid"
-
     if place == "中山":
         if d <= 1200: return "outer_short"
         if d == 1600: return "outer_mid"
         if d in [1800, 2000]: return "inner_mid"
         if d >= 2200: return "inner_long"
         return "inner_mid"
-
     if place == "新潟":
         if d <= 1000: return "straight"
         if d <= 1400: return "inner_short"
@@ -109,73 +93,59 @@ def _get_track_layout(place, dist):
         if d in [1800, 2000]: return "outer_mid"
         if d >= 2200: return "inner_long"
         return "outer_mid"
-
     if place == "東京":
         if d <= 1400: return "short"
         if d <= 1800: return "mid"
         if d <= 2400: return "classic"
         return "long"
-
     if place == "中京":
         if d <= 1200: return "short"
         if d <= 1600: return "mid"
         if d <= 2000: return "classic"
         return "long"
-
     if place in ("札幌", "函館"):
         if d <= 1200: return "short"
         if d <= 1800: return "mid"
         return "long"
-
     if place == "福島":
         if d <= 1200: return "short"
         if d <= 1800: return "mid"
         return "long"
-
     if place == "小倉":
         if d <= 1200: return "short"
         if d <= 1800: return "mid"
         return "long"
-
     if place == "大井":
         if d <= 1400: return "outer_1turn"
         if d <= 1650: return "inner_2turn"
         return "outer_2turn"
-
     if place == "川崎":
         if d == 900: return "1turn"
         if d <= 1600: return "2turn"
         return "multi"
-
     if place == "船橋":
         if d <= 1200: return "1turn"
         if d <= 1800: return "2turn"
         return "multi"
-
     if place == "浦和":
         if d <= 800: return "1turn"
         if d <= 1500: return "2turn"
         return "multi"
-
     if place == "門別":
         if d <= 1000: return "short"
         if d <= 1700: return "mid"
         return "long"
-
     if place == "盛岡":
         if d <= 1000: return "short"
         if d <= 1600: return "mid"
         return "long"
-
     if place == "水沢":
         if d <= 1400: return "short"
         return "standard"
-
     if place in ("金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀"):
         if d <= 1200: return "short"
         if d <= 1600: return "mid"
         return "long"
-
     if place == "帯広":
         return "banei"
 
@@ -185,36 +155,6 @@ def _get_track_layout(place, dist):
 
 def _is_same_track_layout(place, dist1, dist2):
     return _get_track_layout(place, dist1) == _get_track_layout(place, dist2)
-
-def determine_condition(t_place, t_dist, r_place, r_dist):
-    td = int(t_dist) if str(t_dist).isdigit() else 0
-    rd = int(r_dist) if str(r_dist).isdigit() else 0
-
-    if t_place == r_place and td == rd:
-        return 'A'
-    if t_place == r_place:
-        if _is_same_track_layout(t_place, t_dist, r_dist):
-            return 'B'
-        return 'C'
-    return 'C'
-
-def get_rel_str(diff, cond, is_banei=False):
-    abs_d = abs(diff)
-    if is_banei:
-        if abs_d >= 4.0: return ">>" if diff < 0 else "<<"
-        if abs_d >= 1.5: return ">" if diff < 0 else "<"
-        return "＝"
-
-    if cond == 'A':
-        draw_th, strong_th = 0.5, 1.0
-    else:
-        draw_th, strong_th = 0.7, 1.2
-
-    if abs_d >= strong_th:
-        return ">>" if diff < 0 else "<<"
-    if abs_d >= draw_th:
-        return ">" if diff < 0 else "<"
-    return "＝"
 
 
 # ==========================================
@@ -411,7 +351,8 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
         edge_cost = base_cost + reliability_penalty + (0 if is_direct else 100)
 
         history_item = {
-            "date": r_date, "date_str": str(r_date),
+            "date": r_date, 
+            "date_str": r_date.strftime('%Y/%m/%d') if isinstance(r_date, datetime) and r_date != datetime.min else str(r_date),
             "place": r_place, "dist": r_dist_str,
             "raw_diff": capped_diff, "badge": badge,
             "race_id": race_id,
@@ -484,7 +425,6 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
 def compute_pairwise_results(G, runners, target_course, target_distance, is_banei):
     current_names = set(runners)
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
-
     pair_net = {u: {v: [] for v in runners} for u in runners}
 
     for u in runners:
@@ -602,25 +542,34 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             else:
                 draw_th, strong_th = 0.7, 1.2
 
-            # 時間経過による減衰係数（鮮度重み付け）
-            adj_diffs = []
+            # 【修正点】「勝敗のカウント」には減衰前の生データを使用し、
+            # 「着差の平均」のみ時間経過で減衰させます（過去の勝利が消滅するのを防ぐため）
+            wins = 0
+            losses = 0
+            weighted_sum = 0
+            total_weight = 0
+
             for entry in target_entries:
                 dt = entry["date"]
                 days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
                 months_ago = max(0, days_ago / 30.0)
-                weight = max(0.4, 0.9 ** months_ago)
-                adj_diff = entry["diff"] * weight
-                adj_diffs.append(adj_diff)
+                weight = max(0.6, 0.95 ** months_ago) # 緩やかな減衰
+                
+                d = entry["diff"]
+                # 生の着差で勝敗を判定
+                if d >= draw_th: wins += 1
+                elif d <= -draw_th: losses += 1
+                
+                weighted_sum += d * weight
+                total_weight += weight
 
-            wins = sum(1 for d in adj_diffs if d >= draw_th)
-            losses = sum(1 for d in adj_diffs if d <= -draw_th)
-            avg_diff = sum(adj_diffs) / len(adj_diffs) if adj_diffs else 0
+            avg_diff = weighted_sum / total_weight if total_weight > 0 else 0
 
             if is_forgiven:
                 matchup_matrix[u][v] = "="
-            elif wins == len(adj_diffs) and wins > 0:
+            elif wins == len(target_entries) and wins > 0:
                 matchup_matrix[u][v] = ">>" if avg_diff >= strong_th else ">"
-            elif losses == len(adj_diffs) and losses > 0:
+            elif losses == len(target_entries) and losses > 0:
                 matchup_matrix[u][v] = "<<" if avg_diff <= -strong_th else "<"
             elif wins > losses:
                 matchup_matrix[u][v] = ">"
@@ -664,7 +613,7 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     pool = list(comparable_horses)
 
     if pool:
-        # 1. 勝敗（> と >>）だけで有向グラフを作成（「＝」は含めない）
+        # 勝敗のみで有向グラフを作成（uがvに勝った場合、v -> u にエッジを張る）
         DG = nx.DiGraph()
         for u in pool:
             DG.add_node(u)
@@ -675,22 +624,21 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
                 rel = matchup_matrix[u].get(v)
                 if not rel: continue
                 
-                # u > v (uの方が強い) なら、v から u へエッジ（下位から上位へのパス）
+                # uが勝者(>)なら、敗者vから勝者uへのパスを作成
                 if rel == ">>":
                     DG.add_edge(v, u, weight=2)
                 elif rel == ">":
                     DG.add_edge(v, u, weight=1)
                         
-        # 2. 真の三すくみ(A>B>C>A)のみを縮約してDAG化
+        # 循環（三すくみ）の縮約
         cg = nx.condensation(DG)
         
-        # 3. 各グループのベースレベル（最長パス）を計算
+        # トポロジカルソートで最長パスを計算し、下層から上層へレベルを上げる
         scc_levels = {n: 0 for n in cg.nodes()}
         for n in nx.topological_sort(cg):
             for succ in cg.successors(n):
                 members_n = cg.nodes[n]['members']
                 members_succ = cg.nodes[succ]['members']
-                
                 weights = [DG[u][v]['weight'] for u in members_n for v in members_succ if DG.has_edge(u, v)]
                 max_w = max(weights) if weights else 1
                 
@@ -702,22 +650,9 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             for horse in cg.nodes[n]['members']:
                 horse_levels[horse] = lvl
 
-        # 4. 「＝」の同格関係による引き上げ補正（無限連鎖を防ぐため1回だけ）
-        level_updates = horse_levels.copy()
-        for u in pool:
-            for v in pool:
-                if u == v: continue
-                if matchup_matrix[u].get(v) == "=":
-                    # 同格なのにレベル差がついている場合、低い方を「高い方 - 1.0(1ランク下)」まで引き上げる
-                    max_lvl = max(horse_levels[u], horse_levels[v])
-                    if horse_levels[u] < max_lvl:
-                        level_updates[u] = max(level_updates[u], max_lvl - 1.0)
-                    if horse_levels[v] < max_lvl:
-                        level_updates[v] = max(level_updates[v], max_lvl - 1.0)
-                        
-        horse_levels = level_updates
+        # 【修正点】「＝（引き分け）」による曖昧なランク引き上げ処理を撤廃し、
+        # 純粋な勝敗グラフの長さにのみ基づいてランクを決定する
 
-        # 5. ランク割り当て（インフレを防ぐため幅を持たせる）
         max_level = max(horse_levels.values()) if horse_levels else 0
         
         for h, lvl in horse_levels.items():
@@ -725,9 +660,9 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             
             if diff <= 0.5:
                 all_tiers[h] = "S"
-            elif diff <= 1.5:  # 「>」 1つ分の差まで
+            elif diff <= 1.5:
                 all_tiers[h] = "A"
-            elif diff <= 3.0:  # 「>>」 1つ分、または「>」 2〜3つ分の差
+            elif diff <= 3.0:
                 all_tiers[h] = "B"
             else:
                 all_tiers[h] = "C"
@@ -995,7 +930,7 @@ def analyze_race(scraper, race_id, water_mode=None):
         # 3. 対戦マトリクス
         matchup_matrix = compute_matchup_matrix(pair_net, runners, G, t_course, t_dist)
 
-        # 4. ティア判定 (DAG + Topological Sort)
+        # 4. ティア判定
         tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, G, uma_dict, is_banei)
 
         # 5. HTML出力
@@ -1012,9 +947,9 @@ def analyze_race(scraper, race_id, water_mode=None):
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
-st.title("🏇 競馬AI 究極相対評価 (DAGトポロジカルソート実装版)")
+st.title("🏇 競馬AI 究極相対評価 (バグ修正版)")
 st.caption(
-    "【更新点】相対評価ロジックにNetworkXを用いたDAG（有向非巡回グラフ）縮約とトポロジカルソートを実装。三すくみなどの循環参照に強くなり、適切なランク付けを行います。"
+    "【更新点】過去の生データに基づく厳格な勝敗判定、および引き分け等による過剰なランク上昇バグを修正。日付も綺麗に表示されるようにしました。"
 )
 
 url_input = st.text_input(
