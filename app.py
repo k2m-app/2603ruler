@@ -347,7 +347,7 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
         elif is_same_place: badge = "[場]"
         elif dist_diff_val == 0: badge = "[距]"
 
-        reliability_penalty = 0 if abs(capped_diff) <= 0.5 else (5 if abs(capped_diff) <= 1.0 else 15)
+        reliability_penalty = 0 if abs(capped_diff) <= 0.55 else (5 if abs(capped_diff) <= 1.05 else 15)
         edge_cost = base_cost + reliability_penalty + (0 if is_direct else 100)
 
         history_item = {
@@ -553,7 +553,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                         if entry["diff"] < 0: is_forgiven_u = True
                         if -entry["diff"] < 0: is_forgiven_v = True
 
-            draw_th, strong_th = (0.5, 1.0) if best_is_strict else (0.7, 1.2)
+            draw_th, strong_th = (0.55, 1.05) if best_is_strict else (0.75, 1.25)
 
             # 日付順ソート＆直近3戦のみ抽出
             target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
@@ -633,6 +633,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
     total_opponents = len(runners) - 1
+    now = datetime.now()
 
     comparable_horses = set()
     for u in runners:
@@ -669,12 +670,40 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
                 if rel:
                     h_a, h_b = (u, v) if u < v else (v, u)
                     is_direct = G.has_edge(h_a, h_b)
-                    weight = 3.0 if is_direct else 1.0 
+                    entries_uv = pair_net[u].get(v, [])
+                    has_strict = any(e.get("is_strict") for e in entries_uv)
+                    
+                    if is_direct:
+                        base_weight = 2.0
+                    elif has_strict:
+                        base_weight = 1.8
+                    else:
+                        base_weight = 1.0 
 
+                    time_decay = 1.0
+                    if entries_uv:
+                        latest_dt = datetime.min
+                        for e in entries_uv:
+                            dt = e.get("date", datetime.min)
+                            if isinstance(dt, datetime) and dt > latest_dt:
+                                latest_dt = dt
+                        if latest_dt != datetime.min:
+                            months_ago = max(0, (now - latest_dt).days / 30.0)
+                            time_decay = max(0.3, 0.85 ** months_ago)
+
+                    weight = base_weight * time_decay
                     count += weight
+
                     if rel == ">>":   pts += 3.0 * weight
                     elif rel == ">":  pts += 1.5 * weight
-                    elif rel == "=":  pts += 0.0 * weight
+                    elif rel == "=":
+                        # 引き分けでもタイム差を部分点として加算
+                        if entries_uv:
+                            avg_diff = sum(e.get("diff", 0) for e in entries_uv) / len(entries_uv)
+                            partial = max(-0.5, min(0.5, avg_diff * 0.7))
+                        else:
+                            partial = 0.0
+                        pts += partial * weight
                     elif rel == "<":  pts -= 1.5 * weight
                     elif rel == "<<": pts -= 3.0 * weight
 
@@ -738,6 +767,45 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             elif doms >= 2 and current_tier == "C":
                 all_tiers[h] = "B"
 
+        # === 相対整合性チェック: 対戦結果に基づく昇降格 ===
+        # パス1: 昇格（下位→上位への調整）
+        for h in pool:
+            tier = all_tiers.get(h)
+            if tier == "A":
+                s_horses = [v for v in pool if v != h and all_tiers.get(v) == "S"]
+                matchups_vs_s = [matchup_matrix[h].get(v) for v in s_horses if matchup_matrix[h].get(v)]
+                if len(matchups_vs_s) >= 2:
+                    losses = sum(1 for r in matchups_vs_s if r in ("<", "<<"))
+                    if losses == 0:
+                        all_tiers[h] = "S"
+            elif tier == "B":
+                a_or_above = [v for v in pool if v != h and all_tiers.get(v) in ("S", "A")]
+                matchups = [matchup_matrix[h].get(v) for v in a_or_above if matchup_matrix[h].get(v)]
+                if len(matchups) >= 2:
+                    losses = sum(1 for r in matchups if r in ("<", "<<"))
+                    if losses == 0:
+                        all_tiers[h] = "A"
+
+        # パス2: 降格（上位→下位への調整）
+        for h in pool:
+            tier = all_tiers.get(h)
+            if tier == "S":
+                s_peers = [v for v in pool if v != h and all_tiers.get(v) == "S"]
+                matchups_vs_s = [matchup_matrix[h].get(v) for v in s_peers if matchup_matrix[h].get(v)]
+                if matchups_vs_s:
+                    wins = sum(1 for r in matchups_vs_s if r in (">", ">>"))
+                    losses = sum(1 for r in matchups_vs_s if r in ("<", "<<"))
+                    if losses > wins and losses >= 2:
+                        all_tiers[h] = "A"
+            elif tier == "A":
+                lower = [v for v in pool if v != h and all_tiers.get(v) in ("B", "C")]
+                matchups = [matchup_matrix[h].get(v) for v in lower if matchup_matrix[h].get(v)]
+                if matchups:
+                    wins = sum(1 for r in matchups if r in (">", ">>"))
+                    losses = sum(1 for r in matchups if r in ("<", "<<"))
+                    if losses > wins and losses >= 2:
+                        all_tiers[h] = "B"
+
     tier_map = {}
     ranked = []
     unranked = []
@@ -769,9 +837,9 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
     def _diff_symbol_and_color(adv, is_same_cond=True):
         aa = abs(adv)
         if is_same_cond:
-            draw_limit, strong_limit = 0.5, 1.0
+            draw_limit, strong_limit = 0.55, 1.05
         else:
-            draw_limit, strong_limit = 0.7, 1.2
+            draw_limit, strong_limit = 0.75, 1.25
 
         if aa <= draw_limit:
             return "＝", "#888"
@@ -798,9 +866,9 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
                         race_groups[r_key] = []
                     race_groups[r_key].append((v, adv))
 
-        total_wins = sum(1 for opps in race_groups.values() for _, a in opps if a >= 0.5)
-        total_draws = sum(1 for opps in race_groups.values() for _, a in opps if abs(a) < 0.5)
-        total_losses = sum(1 for opps in race_groups.values() for _, a in opps if a <= -0.5)
+        total_wins = sum(1 for opps in race_groups.values() for _, a in opps if a >= 0.55)
+        total_draws = sum(1 for opps in race_groups.values() for _, a in opps if abs(a) < 0.55)
+        total_losses = sum(1 for opps in race_groups.values() for _, a in opps if a <= -0.55)
         if total_wins + total_draws + total_losses > 0:
             sp = []
             if total_wins: sp.append(f"<span style='color:#27ae60; font-weight:bold;'>{total_wins}勝</span>")
@@ -1020,7 +1088,7 @@ st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", l
 
 st.title("🏇 競馬AI 究極相対評価 (穴馬ポテンシャル最適化版)")
 st.caption(
-    "【更新点】全走平均では「負け（＜）」の馬が、上位2走平均なら「勝ち（＞）」に逆転する場合のみ大敗ノーカンとする条件付き救済を実装。また、直近3走の重みを「1.0倍, 0.9倍, 0.7倍」に平準化しました。"
+    "【更新点】引き分け時の部分点付与、間接比較・同条件に対するウェイト減衰、および2段階の昇降格パス（勝率ベースでのS〜Cランク微調整）を実装しました。"
 )
 
 url_input = st.text_input(
