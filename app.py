@@ -628,17 +628,15 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
 
 # ==========================================
-# 5. ティア判定（勝率・ポイントベースの絶対スコア方式）
+# 5. ティア判定（プール内でのLossカウントによる勝ち抜け方式）
 # ==========================================
 def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
     runners = list(umaban_dict.keys())
-    total_opponents = len(runners) - 1
-    now = datetime.now()
-
+    
     comparable_horses = set()
     for u in runners:
         for v in runners:
-            if u != v and pair_net[u][v]:
+            if u != v and pair_net[u].get(v):
                 comparable_horses.add(u)
                 comparable_horses.add(v)
 
@@ -647,164 +645,43 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
         if u not in comparable_horses:
             all_tiers[u] = None
 
-    COVERAGE_THRESHOLD = 0.25
-    for u in list(comparable_horses):
-        compared_count = sum(1 for v in runners if u != v and len(pair_net[u][v]) > 0)
-        coverage = compared_count / total_opponents if total_opponents > 0 else 0
-        if coverage < COVERAGE_THRESHOLD:
-            has_strong_win = any(matchup_matrix[u].get(v) in (">", ">>") for v in runners)
-            if not has_strong_win:
-                all_tiers[u] = None
-                comparable_horses.discard(u)
-
     pool = list(comparable_horses)
-
     if pool:
-        horse_points = {}
-        for u in pool:
-            pts = 0.0
-            count = 0
-            for v in pool:
-                if u == v: continue
-                rel = matchup_matrix[u].get(v)
-                if rel:
-                    h_a, h_b = (u, v) if u < v else (v, u)
-                    is_direct = G.has_edge(h_a, h_b)
-                    entries_uv = pair_net[u].get(v, [])
-                    has_strict = any(e.get("is_strict") for e in entries_uv)
-                    
-                    if is_direct:
-                        base_weight = 2.0
-                    elif has_strict:
-                        base_weight = 1.8
-                    else:
-                        base_weight = 1.0 
-
-                    time_decay = 1.0
-                    if entries_uv:
-                        latest_dt = datetime.min
-                        for e in entries_uv:
-                            dt = e.get("date", datetime.min)
-                            if isinstance(dt, datetime) and dt > latest_dt:
-                                latest_dt = dt
-                        if latest_dt != datetime.min:
-                            months_ago = max(0, (now - latest_dt).days / 30.0)
-                            time_decay = max(0.3, 0.85 ** months_ago)
-
-                    weight = base_weight * time_decay
-                    count += weight
-
-                    if rel == ">>":   pts += 3.0 * weight
-                    elif rel == ">":  pts += 1.5 * weight
-                    elif rel == "=":
-                        # 引き分けでもタイム差を部分点として加算
-                        if entries_uv:
-                            avg_diff = sum(e.get("diff", 0) for e in entries_uv) / len(entries_uv)
-                            partial = max(-0.5, min(0.5, avg_diff * 0.7))
-                        else:
-                            partial = 0.0
-                        pts += partial * weight
-                    elif rel == "<":  pts -= 1.5 * weight
-                    elif rel == "<<": pts -= 3.0 * weight
-
-            avg_pts = pts / count if count > 0 else 0
-            horse_points[u] = avg_pts
-
-        horse_stats = {}
-        for u in pool:
-            wins = 0
-            losses = 0
-            dominations = 0
-            total = 0
-            for v in pool:
-                if u == v: continue
-                rel = matchup_matrix[u].get(v)
-                if not rel: continue
-                total += 1
-                if rel in (">", ">>"): wins += 1
-                if rel == ">>": dominations += 1
-                if rel in ("<", "<<"): losses += 1
-
-            win_rate = wins / total if total > 0 else 0.0
-            loss_rate = losses / total if total > 0 else 0.0
-            dom_rate = dominations / total if total > 0 else 0.0
-
-            pts_component = horse_points.get(u, 0)
-            winrate_component = (win_rate - loss_rate) * 3.0
-            dom_component = dom_rate * 3.0
-
-            combined = pts_component * 0.5 + winrate_component * 0.3 + dom_component * 0.2
-
-            horse_stats[u] = {
-                "combined": combined,
-                "wins": wins, "losses": losses, "dominations": dominations,
-                "total": total, "win_rate": win_rate, "dom_rate": dom_rate
-            }
-
-        ranked_pool = sorted(horse_stats.items(), key=lambda x: x[1]["combined"], reverse=True)
-        top_score = ranked_pool[0][1]["combined"] if ranked_pool else 0
-        bottom_score = ranked_pool[-1][1]["combined"] if ranked_pool else 0
-        spread = top_score - bottom_score
-
-        if spread < 0.3:
-            for h, stats in ranked_pool:
-                all_tiers[h] = "B"
-        else:
-            step = spread / 4.0
-            for h, stats in ranked_pool:
-                diff_from_top = top_score - stats["combined"]
-                if diff_from_top <= step: all_tiers[h] = "S"
-                elif diff_from_top <= step * 2: all_tiers[h] = "A"
-                elif diff_from_top <= step * 3: all_tiers[h] = "B"
-                else: all_tiers[h] = "C"
-
-        for h in pool:
-            stats = horse_stats.get(h, {})
-            doms = stats.get("dominations", 0)
-            current_tier = all_tiers.get(h)
-            if doms >= 3 and current_tier in ("B", "C"):
-                all_tiers[h] = "A"
-            elif doms >= 2 and current_tier == "C":
-                all_tiers[h] = "B"
-
-        # === 相対整合性チェック: 対戦結果に基づく昇降格 ===
-        # パス1: 昇格（下位→上位への調整）
-        for h in pool:
-            tier = all_tiers.get(h)
-            if tier == "A":
-                s_horses = [v for v in pool if v != h and all_tiers.get(v) == "S"]
-                matchups_vs_s = [matchup_matrix[h].get(v) for v in s_horses if matchup_matrix[h].get(v)]
-                if len(matchups_vs_s) >= 2:
-                    losses = sum(1 for r in matchups_vs_s if r in ("<", "<<"))
-                    if losses == 0:
-                        all_tiers[h] = "S"
-            elif tier == "B":
-                a_or_above = [v for v in pool if v != h and all_tiers.get(v) in ("S", "A")]
-                matchups = [matchup_matrix[h].get(v) for v in a_or_above if matchup_matrix[h].get(v)]
-                if len(matchups) >= 2:
-                    losses = sum(1 for r in matchups if r in ("<", "<<"))
-                    if losses == 0:
-                        all_tiers[h] = "A"
-
-        # パス2: 降格（上位→下位への調整）
-        for h in pool:
-            tier = all_tiers.get(h)
-            if tier == "S":
-                s_peers = [v for v in pool if v != h and all_tiers.get(v) == "S"]
-                matchups_vs_s = [matchup_matrix[h].get(v) for v in s_peers if matchup_matrix[h].get(v)]
-                if matchups_vs_s:
-                    wins = sum(1 for r in matchups_vs_s if r in (">", ">>"))
-                    losses = sum(1 for r in matchups_vs_s if r in ("<", "<<"))
-                    if losses > wins and losses >= 2:
-                        all_tiers[h] = "A"
-            elif tier == "A":
-                lower = [v for v in pool if v != h and all_tiers.get(v) in ("B", "C")]
-                matchups = [matchup_matrix[h].get(v) for v in lower if matchup_matrix[h].get(v)]
-                if matchups:
-                    wins = sum(1 for r in matchups if r in (">", ">>"))
-                    losses = sum(1 for r in matchups if r in ("<", "<<"))
-                    if losses > wins and losses >= 2:
-                        all_tiers[h] = "B"
+        current_pool = set(pool)
+        tiers = ["S", "A", "B", "C"]
+        
+        for tier in tiers:
+            if not current_pool:
+                break
+            
+            if tier == "C":
+                # Bランクの馬にも勝てない（ループの最後まで残った）馬は全てCランク
+                for h in current_pool:
+                    all_tiers[h] = "C"
+                break
+            
+            # current_pool 内での互いの負け数(Loss)をカウント
+            loss_counts = {}
+            for u in current_pool:
+                losses = 0
+                for v in current_pool:
+                    if u == v: continue
+                    rel = matchup_matrix[u].get(v)
+                    # 相手に対して負け( < または << )であればカウント
+                    if rel in ("<", "<<"):
+                        losses += 1
+                loss_counts[u] = losses
+            
+            # プール内で最小の負け数を持つ馬をそのTierに割り当て
+            # （理想は loss == 0 つまり「現在のプール内で誰にも負けていない」馬たち）
+            min_losses = min(loss_counts.values())
+            tier_candidates = [u for u, losses in loss_counts.items() if losses == min_losses]
+            
+            for h in tier_candidates:
+                all_tiers[h] = tier
+                
+            # 決定した馬をプールから除外して、次のTierの計算へ進む
+            current_pool -= set(tier_candidates)
 
     tier_map = {}
     ranked = []
@@ -819,6 +696,7 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             score_val = {"S": 4, "A": 3, "B": 2, "C": 1}.get(tier, 0)
             ranked.append((u, score_val))
 
+    # ソート順を維持（スコアによるソート）
     ranked.sort(key=lambda x: x[1], reverse=True)
 
     return tier_map, ranked, unranked
@@ -1069,7 +947,7 @@ def analyze_race(scraper, race_id, water_mode=None):
         # 3. 対戦マトリクス
         matchup_matrix = compute_matchup_matrix(pair_net, runners, G, t_course, t_dist)
 
-        # 4. ティア判定
+        # 4. ティア判定 (勝ち抜け方式)
         tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, G, uma_dict, is_banei)
 
         # 5. HTML出力
@@ -1088,7 +966,7 @@ st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", l
 
 st.title("🏇 競馬AI 究極相対評価 (穴馬ポテンシャル最適化版)")
 st.caption(
-    "【更新点】引き分け時の部分点付与、間接比較・同条件に対するウェイト減衰、および2段階の昇降格パス（勝率ベースでのS〜Cランク微調整）を実装しました。"
+    "【更新点】地方競馬版（keiba_bot.py）のTier決定アルゴリズム（Lossカウント勝ち抜け方式）を移植しました。"
 )
 
 url_input = st.text_input(
