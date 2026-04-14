@@ -31,7 +31,6 @@ def parse_date(date_str):
         pass
     return datetime.min
 
-
 # ==========================================
 # 1. コース形態判定
 # ==========================================
@@ -155,7 +154,6 @@ def _get_track_layout(place, dist):
 
 def _is_same_track_layout(place, dist1, dist2):
     return _get_track_layout(place, dist1) == _get_track_layout(place, dist2)
-
 
 # ==========================================
 # 3. Netkeiba ディープスクレイパー
@@ -319,7 +317,6 @@ class NetkeibaScraper:
 
         return race_title, target_course, target_distance, list(past_races_dict.values()), umaban_dict, is_banei
 
-
 # ==========================================
 # 4. NetworkXグラフベースの相対評価エンジン
 # ==========================================
@@ -420,9 +417,18 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
                         raw_diff = h1_time - h2_time
                         _add_edge(h1_name, h2_name, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, False)
 
+    # 履歴のチューニング：同場・同距離の重複を排除し、最新情報を優先
     for u, v, d in G.edges(data=True):
         d["history"].sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
-        d["history"] = d["history"][:3] # 直近3走までで打ち切り
+        seen_cond = set()
+        deduped = []
+        for hi in d["history"]:
+            cond_key = (hi.get("place", ""), hi.get("dist", ""))
+            if cond_key in seen_cond:
+                continue
+            seen_cond.add(cond_key)
+            deduped.append(hi)
+        d["history"] = deduped[:5] # 最大5走まで保持（表示は3走に絞る）
         d["diffs"] = [hi["raw_diff"] for hi in d["history"]]
         d["rank_diff"] = sum(d["diffs"]) / len(d["diffs"]) if d["diffs"] else 0
 
@@ -534,7 +540,7 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
     for i, u in enumerate(runners):
         for j, v in enumerate(runners):
-            if i >= j: continue # 完全対称処理のため半分だけ計算
+            if i >= j: continue
 
             entries_u = pair_net[u].get(v, [])
             if not entries_u:
@@ -555,16 +561,24 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
 
             draw_th, strong_th = (0.55, 1.05) if best_is_strict else (0.75, 1.25)
 
-            # 日付順ソート＆直近3戦のみ抽出
             target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
             target_entries = target_entries[:3]
 
-            # 時系列ウェイトの付与（1.0, 0.9, 0.7）
+            # 【チューニング】勝負づけ未済（勝ち負け混在）の判定
+            if best_is_strict and len(target_entries) >= 2:
+                has_win = any(e["diff"] >= draw_th for e in target_entries)
+                has_loss = any(e["diff"] <= -draw_th for e in target_entries)
+                if has_win and has_loss:
+                    matchup_matrix[u][v] = "="
+                    matchup_matrix[v][u] = "="
+                    continue
+
             for k, entry in enumerate(target_entries):
                 if k == 0: entry["weight"] = 1.0
                 elif k == 1: entry["weight"] = 0.9
                 else: entry["weight"] = 0.7
 
+            # 【チューニング】精緻化された時間減衰処理
             def get_sym(entries, sign=1.0):
                 if not entries: return "="
                 wins = losses = weighted_sum = total_weight = 0
@@ -572,7 +586,17 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                     dt = entry["date"]
                     days_ago = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
                     months_ago = max(0, days_ago / 30.0)
-                    time_weight = max(0.2, 0.75 ** months_ago)
+
+                    if best_is_strict:
+                        if months_ago <= 3.0: time_weight = 1.0
+                        elif months_ago <= 6.0: time_weight = 0.6
+                        else: time_weight = 0.3
+                    else:
+                        if months_ago <= 2.0: time_weight = 1.0
+                        elif months_ago <= 3.0: time_weight = 0.8
+                        elif months_ago <= 6.0: time_weight = 0.6
+                        else: time_weight = 0.3
+
                     w = entry["weight"] * time_weight
                     
                     d = entry["diff"] * sign
@@ -584,30 +608,21 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                     
                 avg = weighted_sum / total_weight if total_weight > 0 else 0
                 
-                if wins == len(entries) and wins > 0:
-                    return ">>" if avg >= strong_th else ">"
-                if losses == len(entries) and losses > 0:
-                    return "<<" if avg <= -strong_th else "<"
+                if wins == len(entries) and wins > 0: return ">>" if avg >= strong_th else ">"
+                if losses == len(entries) and losses > 0: return "<<" if avg <= -strong_th else "<"
                 if avg >= draw_th: return ">"
                 if avg <= -draw_th: return "<"
                 return "="
 
-            # 1. 全レースの平均評価
             sym_all_u = get_sym(target_entries, sign=1.0)
-            
-            # 2. U視点での上位2レースの評価
             sorted_for_u = sorted(target_entries, key=lambda x: x["diff"], reverse=True)
             sym_best2_u = get_sym(sorted_for_u[:2], sign=1.0)
             
-            # 3. V視点での上位2レースの評価
             sorted_for_v = sorted(target_entries, key=lambda x: x["diff"])
             sym_best2_v = get_sym(sorted_for_v[:2], sign=-1.0)
 
-            # 【重要】アウトライアー救済条件
-            # 「全平均では『負け（＜）』だが、上位2走を取れば『勝ち（＞）』になる」場合のみ救済し、
-            # 単なる「＝」を過剰に「＞」へ引き上げることはしない。
+            # 【チューニング】アウトライアー救済
             rescue_u = (sym_all_u in ["<", "<<"] and sym_best2_u in [">", ">>"])
-            
             sym_all_v = inverse_sym(sym_all_u)
             rescue_v = (sym_all_v in ["<", "<<"] and sym_best2_v in [">", ">>"])
 
@@ -625,7 +640,6 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             matchup_matrix[v][u] = inverse_sym(final_sym_u)
 
     return matchup_matrix
-
 
 # ==========================================
 # 5. ティア判定（プール内でのLossカウントによる勝ち抜け方式）
@@ -655,32 +669,26 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
                 break
             
             if tier == "C":
-                # Bランクの馬にも勝てない（ループの最後まで残った）馬は全てCランク
                 for h in current_pool:
                     all_tiers[h] = "C"
                 break
             
-            # current_pool 内での互いの負け数(Loss)をカウント
             loss_counts = {}
             for u in current_pool:
                 losses = 0
                 for v in current_pool:
                     if u == v: continue
                     rel = matchup_matrix[u].get(v)
-                    # 相手に対して負け( < または << )であればカウント
                     if rel in ("<", "<<"):
                         losses += 1
                 loss_counts[u] = losses
             
-            # プール内で最小の負け数を持つ馬をそのTierに割り当て
-            # （理想は loss == 0 つまり「現在のプール内で誰にも負けていない」馬たち）
             min_losses = min(loss_counts.values())
             tier_candidates = [u for u, losses in loss_counts.items() if losses == min_losses]
             
             for h in tier_candidates:
                 all_tiers[h] = tier
                 
-            # 決定した馬をプールから除外して、次のTierの計算へ進む
             current_pool -= set(tier_candidates)
 
     tier_map = {}
@@ -696,14 +704,12 @@ def evaluate_and_rank(pair_net, matchup_matrix, G, umaban_dict, is_banei):
             score_val = {"S": 4, "A": 3, "B": 2, "C": 1}.get(tier, 0)
             ranked.append((u, score_val))
 
-    # ソート順を維持（スコアによるソート）
     ranked.sort(key=lambda x: x[1], reverse=True)
 
     return tier_map, ranked, unranked
 
-
 # ==========================================
-# 6. HTML出力（対戦詳細付き）
+# 6. HTML出力（対戦詳細＆三すくみ判定付き）
 # ==========================================
 def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup_matrix, G, target_course, target_distance):
     html_parts = ["<div style='font-family: sans-serif; font-size:14px; color:#333;'>"]
@@ -711,6 +717,19 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
     runners = list(umaban_dict.keys())
     current_names = set(runners)
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
+
+    # 【チューニング】三すくみペアの検出
+    cycle_pairs = set()
+    names = list(matchup_matrix.keys())
+    for i, a in enumerate(names):
+        for j, b in enumerate(names):
+            if i == j: continue
+            if matchup_matrix[a].get(b) not in (">", ">>"): continue
+            for k, c in enumerate(names):
+                if k == i or k == j: continue
+                if (matchup_matrix[b].get(c) in (">", ">>") and
+                    matchup_matrix[c].get(a) in (">", ">>")):
+                    cycle_pairs.update({(a, b), (b, c), (c, a)})
 
     def _diff_symbol_and_color(adv, is_same_cond=True):
         aa = abs(adv)
@@ -768,6 +787,15 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
             is_match = (r_place == target_course and str(r_dist) == str(target_distance))
             style = "background:#fff9c4; border-left:3px solid #fbc02d; padding-left:5px;" if is_match else ""
             badge = " <span style='color:#fbc02d; font-weight:bold;'>[同条件]</span>" if is_match else ""
+
+            # 【チューニング】三すくみバッジの表示
+            opp_names_in_race = {v for v, _ in opps}
+            has_cycle = any(
+                (u == a and b in opp_names_in_race) or (u == b and a in opp_names_in_race)
+                for (a, b) in cycle_pairs
+            )
+            if has_cycle:
+                badge += " <span style='color:#e74c3c; font-weight:bold;'>⚡三すくみ</span>"
 
             parts.append(f"<div style='margin-left:10px; font-size:0.85em; {style}'>🔍 {r_date} {r_place}{r_dist}{badge}</div>")
 
@@ -893,7 +921,6 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
     html_parts.append("</div>")
     return "\n".join(html_parts)
 
-
 # ==========================================
 # 7. 一括HTML出力（タブ付き）
 # ==========================================
@@ -926,7 +953,6 @@ function openTab(evt, id) {{
 }}
 </script></body></html>"""
 
-
 # ==========================================
 # 8. メインパイプライン統合関数
 # ==========================================
@@ -958,16 +984,13 @@ def analyze_race(scraper, race_id, water_mode=None):
     except Exception as e:
         return f"レースID: {race_id}", f"エラー: {str(e)}"
 
-
 # ==========================================
 # 9. Streamlit UI
 # ==========================================
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
 st.title("🏇 競馬AI 究極相対評価 (穴馬ポテンシャル最適化版)")
-st.caption(
-    "【更新点】地方競馬版（keiba_bot.py）のTier決定アルゴリズム（Lossカウント勝ち抜け方式）を移植しました。"
-)
+st.caption("【更新点】地方・中央全対応。時間減衰の精緻化、過去対戦の重複排除、三すくみ検知を統合しました。")
 
 url_input = st.text_input(
     "netkeibaのレースURL",
