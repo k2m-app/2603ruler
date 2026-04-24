@@ -216,7 +216,11 @@ class NetkeibaScraper:
             name_tag = tr.find(class_='Horse02')
             if not name_tag:
                 continue
-            horse_name = name_tag.find('a').text.strip()
+            
+            # 馬名の取得と空チェック（イレギュラーデータ排除）
+            horse_name = name_tag.find('a').text.strip() if name_tag.find('a') else ""
+            if not horse_name:
+                continue
 
             tds = tr.find_all('td')
             if len(tds) > 1:
@@ -284,6 +288,8 @@ class NetkeibaScraper:
                     horse_cell = tds[3]
                     horse_link = horse_cell.find('a')
                     h_name = horse_link.text.strip() if horse_link else horse_cell.text.strip()
+                    if not h_name:
+                        continue
 
                     time_str = None
                     if len(tds) > 7:
@@ -328,7 +334,9 @@ def build_comparison_graph(past_races, target_course, target_distance, umaban_di
     G = nx.DiGraph()
 
     def _add_edge(h1_name, h2_name, raw_diff, r_date, r_place, r_dist_str, race_id, base_cost, is_direct):
-        if h1_name > h2_name:
+        # 型不整合による比較エラー防止
+        h1_str, h2_str = str(h1_name), str(h2_name)
+        if h1_str > h2_str:
             h1_name, h2_name = h2_name, h1_name
             raw_diff = -raw_diff
 
@@ -444,7 +452,8 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
             if u == v: continue
 
             direct_entries = []
-            h_a, h_b = (u, v) if u < v else (v, u)
+            # 型不整合防止のため文字列比較
+            h_a, h_b = (u, v) if str(u) < str(v) else (v, u)
 
             if G.has_edge(h_a, h_b):
                 for hi in G[h_a][h_b]["history"]:
@@ -477,14 +486,16 @@ def compute_pairwise_results(G, runners, target_course, target_distance, is_bane
             hidden_nodes = [n for n in G.nodes() if n not in current_names]
             for h in hidden_nodes:
                 u_h_hist = []
-                h_a_uh = (u, h) if u < h else (h, u)
+                # 型不整合防止
+                h_a_uh = (u, h) if str(u) < str(h) else (h, u)
                 if G.has_edge(h_a_uh[0], h_a_uh[1]):
                     for hi in G[h_a_uh[0]][h_a_uh[1]]["history"]:
                         diff = -hi["raw_diff"] if u == h_a_uh[0] else hi["raw_diff"]
                         u_h_hist.append((diff, hi["place"], hi["dist"], hi["date"]))
 
                 h_v_hist = []
-                h_a_hv = (h, v) if h < v else (v, h)
+                # 型不整合防止
+                h_a_hv = (h, v) if str(h) < str(v) else (v, h)
                 if G.has_edge(h_a_hv[0], h_a_hv[1]):
                     for hi in G[h_a_hv[0]][h_a_hv[1]]["history"]:
                         diff = -hi["raw_diff"] if h == h_a_hv[0] else hi["raw_diff"]
@@ -564,7 +575,6 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             target_entries.sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
             target_entries = target_entries[:3]
 
-            # 【チューニング】勝負づけ未済（勝ち負け混在）の判定
             if best_is_strict and len(target_entries) >= 2:
                 has_win = any(e["diff"] >= draw_th for e in target_entries)
                 has_loss = any(e["diff"] <= -draw_th for e in target_entries)
@@ -578,7 +588,6 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
                 elif k == 1: entry["weight"] = 0.9
                 else: entry["weight"] = 0.7
 
-            # 【チューニング】精緻化された時間減衰処理
             def get_sym(entries, sign=1.0):
                 if not entries: return "="
                 wins = losses = weighted_sum = total_weight = 0
@@ -621,7 +630,6 @@ def compute_matchup_matrix(pair_net, runners, G, target_course, target_distance)
             sorted_for_v = sorted(target_entries, key=lambda x: x["diff"])
             sym_best2_v = get_sym(sorted_for_v[:2], sign=-1.0)
 
-            # 【チューニング】アウトライアー救済
             rescue_u = (sym_all_u in ["<", "<<"] and sym_best2_u in [">", ">>"])
             sym_all_v = inverse_sym(sym_all_u)
             rescue_v = (sym_all_v in ["<", "<<"] and sym_best2_v in [">", ">>"])
@@ -718,7 +726,6 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
     current_names = set(runners)
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
 
-    # 【チューニング】三すくみペアの検出
     cycle_pairs = set()
     names = list(matchup_matrix.keys())
     for i, a in enumerate(names):
@@ -754,7 +761,8 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
         race_groups = {}
         for v in runners:
             if u == v: continue
-            h_a, h_b = (u, v) if u < v else (v, u)
+            # 型不整合防止
+            h_a, h_b = (u, v) if str(u) < str(v) else (v, u)
             if G.has_edge(h_a, h_b):
                 for hi in G[h_a][h_b]["history"]:
                     adv = -hi['raw_diff'] if u == h_a else hi['raw_diff']
@@ -776,7 +784,9 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
         def _race_sort_key(item):
             (r_date, r_place, r_dist, r_id), _ = item
             is_same = (r_place == target_course and str(r_dist) == str(target_distance))
-            return (1 if is_same else 0, r_date)
+            # 型不整合防止：日付がない場合は空文字を返す
+            safe_r_date = str(r_date) if r_date is not None else ""
+            return (1 if is_same else 0, safe_r_date)
 
         for (r_date, r_place, r_dist, r_id), opps in sorted(race_groups.items(), key=_race_sort_key, reverse=True):
             if _is_one_turn(target_course, target_distance) and not _is_one_turn(r_place, r_dist):
@@ -788,7 +798,6 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
             style = "background:#fff9c4; border-left:3px solid #fbc02d; padding-left:5px;" if is_match else ""
             badge = " <span style='color:#fbc02d; font-weight:bold;'>[同条件]</span>" if is_match else ""
 
-            # 【チューニング】三すくみバッジの表示
             opp_names_in_race = {v for v, _ in opps}
             has_cycle = any(
                 (u == a and b in opp_names_in_race) or (u == b and a in opp_names_in_race)
@@ -807,7 +816,8 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
         direct_opps = set()
         for v in runners:
             if u == v: continue
-            h_a, h_b = (u, v) if u < v else (v, u)
+            # 型不整合防止
+            h_a, h_b = (u, v) if str(u) < str(v) else (v, u)
             if G.has_edge(h_a, h_b):
                 direct_opps.add(v)
 
@@ -819,8 +829,10 @@ def build_html_output(tier_map, ranked, unranked, umaban_dict, pair_net, matchup
 
             candidates = []
             for h in hidden_nodes:
-                h_a_uh = (u, h) if u < h else (h, u)
-                h_a_hv = (h, v) if h < v else (v, h)
+                # 型不整合防止
+                h_a_uh = (u, h) if str(u) < str(h) else (h, u)
+                h_a_hv = (h, v) if str(h) < str(v) else (v, h)
+                
                 u_h_hist = G[h_a_uh[0]][h_a_uh[1]]["history"] if G.has_edge(h_a_uh[0], h_a_uh[1]) else []
                 h_v_hist = G[h_a_hv[0]][h_a_hv[1]]["history"] if G.has_edge(h_a_hv[0], h_a_hv[1]) else []
 
@@ -990,7 +1002,7 @@ def analyze_race(scraper, race_id, water_mode=None):
 st.set_page_config(page_title="競馬AI 究極相対評価", page_icon="🏇", layout="wide")
 
 st.title("🏇 競馬AI 究極相対評価 (穴馬ポテンシャル最適化版)")
-st.caption("【更新点】地方・中央全対応。時間減衰の精緻化、過去対戦の重複排除、三すくみ検知を統合しました。")
+st.caption("【更新点】地方・中央全対応。時間減衰の精緻化、過去対戦の重複排除、三すくみ検知を統合し、エラー耐性を強化しました。")
 
 url_input = st.text_input(
     "netkeibaのレースURL",
