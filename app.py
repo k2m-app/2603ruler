@@ -333,6 +333,7 @@ class RaceInfo:
     water: Optional[float] = None
     horses: Dict[str, float] = field(default_factory=dict)  # horse_name -> seconds
     ranks: Dict[str, str] = field(default_factory=dict)
+    horse_numbers: Dict[str, str] = field(default_factory=dict)  # horse_name -> 馬番（その過去レース時点）
     source_current_horses: List[str] = field(default_factory=list)
     fetched: bool = False
 
@@ -672,15 +673,22 @@ class NarOfficialScraper:
                 # 取消・中止などは比較不能
                 continue
 
-            # rankは馬名より前にある最初の数字を使う。RaceMarkTableでは行頭の着順。
-            prefix = row_text.split(clean_text(horse_link))[0]
-            rank = ""
-            m = re.search(r"(?<![\d.])(\d{1,2})(?![\d.])", prefix)
-            if m:
-                rank = m.group(1)
+            cells = row.find_all("td")
+            # RaceMarkTableは通常: 0着順 / 1枠番 / 2馬番 / 3馬名 / ... / 11タイム
+            rank = clean_text(cells[0]) if len(cells) > 0 else ""
+            umaban_at_race = clean_text(cells[2]) if len(cells) > 2 else ""
+            if not re.fullmatch(r"\d{1,2}", rank):
+                prefix = row_text.split(clean_text(horse_link))[0]
+                m = re.search(r"(?<![\d.])(\d{1,2})(?![\d.])", prefix)
+                rank = m.group(1) if m else ""
+            if not re.fullmatch(r"\d{1,2}", umaban_at_race):
+                umaban_at_race = ""
+
             race.horses[horse_name] = sec
             if rank:
                 race.ranks[horse_name] = rank
+            if umaban_at_race:
+                race.horse_numbers[horse_name] = umaban_at_race
 
         self.result_cache[url] = race
         return race
@@ -796,6 +804,10 @@ def build_comparison_graph(
             "is_direct": is_direct,
             "is_exact": is_exact,
             "is_same_layout": is_same_layout,
+            "rank_a": race.ranks.get(h1, ""),
+            "rank_b": race.ranks.get(h2, ""),
+            "umaban_a": race.horse_numbers.get(h1, ""),
+            "umaban_b": race.horse_numbers.get(h2, ""),
         }
         if G.has_edge(h1, h2):
             ed = G[h1][h2]
@@ -861,6 +873,16 @@ def advantage_entries_from_edge(G: nx.DiGraph, u: str, v: str) -> List[Dict[str,
         diff = -hi["raw_diff"] if u == a else hi["raw_diff"]
         item = dict(hi)
         item["diff"] = diff
+        if u == a:
+            item["self_rank"] = hi.get("rank_a", "")
+            item["self_umaban"] = hi.get("umaban_a", "")
+            item["opp_rank"] = hi.get("rank_b", "")
+            item["opp_umaban"] = hi.get("umaban_b", "")
+        else:
+            item["self_rank"] = hi.get("rank_b", "")
+            item["self_umaban"] = hi.get("umaban_b", "")
+            item["opp_rank"] = hi.get("rank_a", "")
+            item["opp_umaban"] = hi.get("umaban_a", "")
         out.append(item)
     return out
 
@@ -900,6 +922,10 @@ def compute_pairwise_results(
                         "url": hi.get("url", ""),
                         "title": hi.get("title", ""),
                         "route": "direct",
+                        "self_rank": hi.get("self_rank", ""),
+                        "self_umaban": hi.get("self_umaban", ""),
+                        "opp_rank": hi.get("opp_rank", ""),
+                        "opp_umaban": hi.get("opp_umaban", ""),
                     }
                     if entry["is_strict"]:
                         same_cond.append(entry)
@@ -954,6 +980,9 @@ def compute_pairwise_results(
                         "url": best[5].get("url", ""),
                         "title": best[5].get("title", ""),
                         "route": f"hidden:{h}",
+                        "via_horse": h,
+                        "via_leg1": dict(best[5]),
+                        "via_leg2": dict(best[6]),
                     })
                 elif loose_vals:
                     raw = sum(x[0] for x in loose_vals) / len(loose_vals)
@@ -969,6 +998,9 @@ def compute_pairwise_results(
                         "url": best[5].get("url", ""),
                         "title": best[5].get("title", ""),
                         "route": f"hidden:{h}",
+                        "via_horse": h,
+                        "via_leg1": dict(best[5]),
+                        "via_leg2": dict(best[6]),
                     })
             if candidates:
                 candidates.sort(key=lambda x: (x["is_strict"], abs(x["diff"]), x["date"]), reverse=True)
@@ -1059,15 +1091,32 @@ def evaluate_and_rank(
     matchup_matrix: Dict[str, Dict[str, str]],
     umaban_dict: Dict[str, str],
 ) -> Tuple[Dict[str, str], List[Tuple[str, int]], List[str]]:
+    """直接対決を最重要視してランク化する。"""
     runners = list(umaban_dict.keys())
+
     comparable = set()
     for u in runners:
         for v in runners:
             if u != v and pair_net.get(u, {}).get(v):
                 comparable.add(u)
                 comparable.add(v)
+
     tiers: Dict[str, Optional[str]] = {u: None for u in runners}
     pool = set(comparable)
+
+    def pair_weight(u: str, v: str) -> float:
+        entries = pair_net.get(u, {}).get(v, [])
+        if not entries:
+            return 0.0
+        return 10.0 if any(e.get("route") == "direct" for e in entries) else 1.0
+
+    def rel_strength(rel: str) -> float:
+        if rel in (">>", "<<"):
+            return 1.5
+        if rel in (">", "<"):
+            return 1.0
+        return 0.0
+
     for tier in ("S", "A", "B", "C"):
         if not pool:
             break
@@ -1075,24 +1124,46 @@ def evaluate_and_rank(
             for h in pool:
                 tiers[h] = "C"
             break
-        loss_counts = {}
-        win_counts = {}
+
+        stats: Dict[str, Dict[str, float]] = {}
         for u in pool:
-            losses = wins = 0
+            direct_loss = total_loss = direct_win = total_win = compared = 0.0
             for v in pool:
                 if u == v:
                     continue
                 rel = matchup_matrix.get(u, {}).get(v)
+                w = pair_weight(u, v)
+                if not rel or w <= 0:
+                    continue
+                compared += 1
+                st = rel_strength(rel)
                 if rel in ("<", "<<"):
-                    losses += 1
+                    total_loss += w * st
+                    if w >= 10:
+                        direct_loss += w * st
                 elif rel in (">", ">>"):
-                    wins += 1
-            loss_counts[u] = losses
-            win_counts[u] = wins
-        min_losses = min(loss_counts.values())
-        cands = [u for u in pool if loss_counts[u] == min_losses]
-        max_wins = max(win_counts[u] for u in cands)
-        cands = [u for u in cands if win_counts[u] == max_wins]
+                    total_win += w * st
+                    if w >= 10:
+                        direct_win += w * st
+            stats[u] = {
+                "direct_loss": direct_loss,
+                "total_loss": total_loss,
+                "direct_win": direct_win,
+                "total_win": total_win,
+                "compared": compared,
+            }
+
+        min_direct_loss = min(stats[u]["direct_loss"] for u in pool)
+        cands = [u for u in pool if stats[u]["direct_loss"] == min_direct_loss]
+        min_total_loss = min(stats[u]["total_loss"] for u in cands)
+        cands = [u for u in cands if stats[u]["total_loss"] == min_total_loss]
+        max_direct_win = max(stats[u]["direct_win"] for u in cands)
+        cands = [u for u in cands if stats[u]["direct_win"] == max_direct_win]
+        max_total_win = max(stats[u]["total_win"] for u in cands)
+        cands = [u for u in cands if stats[u]["total_win"] == max_total_win]
+        max_compared = max(stats[u]["compared"] for u in cands)
+        cands = [u for u in cands if stats[u]["compared"] == max_compared]
+
         for h in cands:
             tiers[h] = tier
         pool -= set(cands)
@@ -1108,7 +1179,14 @@ def evaluate_and_rank(
         else:
             tier_map[u] = t
             ranked.append((u, score_by.get(t, 0)))
-    ranked.sort(key=lambda x: (x[1], -int(umaban_dict.get(x[0], "999") if str(umaban_dict.get(x[0], "")).isdigit() else 999)), reverse=True)
+
+    ranked.sort(
+        key=lambda x: (
+            x[1],
+            -int(umaban_dict.get(x[0], "999") if str(umaban_dict.get(x[0], "")).isdigit() else 999),
+        ),
+        reverse=True,
+    )
     return tier_map, ranked, unranked
 
 
@@ -1123,6 +1201,21 @@ def diff_symbol_and_color(adv: float, is_banei: bool, is_strict: bool) -> Tuple[
     if adv > 0:
         return ("≫" if adv >= strong_th else "＞"), "#189a55"
     return ("≪" if adv <= -strong_th else "＜"), "#d83a3a"
+
+
+def _safe_link(url: str, label: str) -> str:
+    label = html.escape(label or "レース")
+    if not url:
+        return label
+    return f"<a href='{html.escape(url)}' target='_blank' rel='noopener noreferrer'>{label}</a>"
+
+
+def _race_link_label(e: Dict[str, Any]) -> str:
+    title = e.get("title") or "レース"
+    date = e.get("date_str") or ""
+    place = e.get("place") or ""
+    dist = e.get("dist") or ""
+    return f"{date} {place}{dist} {title}".strip()
 
 
 def build_html_output(
@@ -1147,8 +1240,47 @@ def build_html_output(
     parts.append(
         f"<div style='padding:10px 12px;background:#f7f9fb;border:1px solid #e1e7ef;border-radius:8px;margin-bottom:14px;'>"
         f"対象条件：<b>{html.escape(target_course)}{html.escape(str(target_distance))}</b>{html.escape(water_txt)}{html.escape(filter_txt)} "
-        f"/ ＞は本馬優勢、＜は劣勢</div>"
+        f"/ 直接対決を最優先 / ＞は本馬優勢、＜は劣勢</div>"
     )
+
+    def render_entry(u: str, v: str, e: Dict[str, Any]) -> str:
+        sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")))
+        badge = "同条件" if e.get("is_strict") else f"{e.get('place','?')}{e.get('dist','?')}"
+        water = e.get("water")
+        wtxt = f"水分:{water:.1f}%" if isinstance(water, (int, float)) else ""
+        v_uma = umaban_dict.get(v, "?")
+        route = e.get("route", "direct")
+        if route == "direct":
+            race_link = _safe_link(e.get("url", ""), _race_link_label(e))
+            self_rank = e.get("self_rank") or "?"
+            self_umaban = e.get("self_umaban") or "?"
+            opp_rank = e.get("opp_rank") or "?"
+            opp_umaban = e.get("opp_umaban") or "?"
+            route_html = (
+                f"<span style='color:#0b65c2;font-weight:700;'>直接</span> "
+                f"<span style='color:#777;'>当時: 本馬 {html.escape(str(self_rank))}着/{html.escape(str(self_umaban))}番 "
+                f"vs 相手 {html.escape(str(opp_rank))}着/{html.escape(str(opp_umaban))}番</span> "
+                f"{race_link}"
+            )
+        else:
+            via = e.get("via_horse") or route.replace("hidden:", "")
+            leg1 = e.get("via_leg1", {}) or {}
+            leg2 = e.get("via_leg2", {}) or {}
+            route_html = (
+                f"<span style='color:#8e44ad;font-weight:700;'>経由：{html.escape(str(via))}</span> "
+                f"<span style='color:#777;'>本馬↔経由馬:</span> {_safe_link(leg1.get('url',''), _race_link_label(leg1))} "
+                f"<span style='color:#aaa;'>/</span> "
+                f"<span style='color:#777;'>経由馬↔相手:</span> {_safe_link(leg2.get('url',''), _race_link_label(leg2))}"
+            )
+        return (
+            f"<div style='margin-left:10px;font-size:.86em;line-height:1.7;margin-bottom:5px;'>"
+            f"<span style='display:inline-block;background:#eef3f8;border-radius:999px;padding:1px 7px;margin-right:4px;'>{html.escape(badge)}</span>"
+            f"<span style='color:#777;'>{html.escape(wtxt)}</span> "
+            f"本馬 <span style='color:{c};font-weight:800;'>{sym}</span> [{html.escape(v_uma)}]{html.escape(v)} "
+            f"<span style='color:{c};'>({e.get('diff',0.0):+.1f}秒換算)</span><br>"
+            f"<span style='margin-left:14px;'>{route_html}</span>"
+            f"</div>"
+        )
 
     def render_horse(u: str) -> str:
         uma = umaban_dict.get(u, "?")
@@ -1158,15 +1290,21 @@ def build_html_output(
             f"<div style='margin:0 0 16px 0;border-left:5px solid {color};padding:10px 12px;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.06);'>",
             f"<div style='font-size:1.1em;font-weight:800;'>[{html.escape(uma)}] {html.escape(u)}</div>",
         ]
-        wins = draws = losses = 0
+        wins = draws = losses = direct_wins = direct_losses = 0
         for v in runners:
             if u == v:
                 continue
             rel = matchup_matrix.get(u, {}).get(v)
+            entries = pair_net.get(u, {}).get(v, [])
+            is_direct = any(e.get("route") == "direct" for e in entries)
             if rel in (">", ">>"):
                 wins += 1
+                if is_direct:
+                    direct_wins += 1
             elif rel in ("<", "<<"):
                 losses += 1
+                if is_direct:
+                    direct_losses += 1
             elif rel == "=":
                 draws += 1
         if wins + draws + losses:
@@ -1174,9 +1312,10 @@ def build_html_output(
                 f"<div style='font-size:.86em;margin:4px 0 8px 0;'>"
                 f"総合対戦：<span style='color:#189a55;font-weight:700;'>{wins}優勢</span> / "
                 f"<span style='color:#777;'>{draws}互角</span> / "
-                f"<span style='color:#d83a3a;font-weight:700;'>{losses}劣勢</span></div>"
+                f"<span style='color:#d83a3a;font-weight:700;'>{losses}劣勢</span> "
+                f"<span style='color:#555;'>（直接: {direct_wins}優勢 / {direct_losses}劣勢）</span></div>"
             )
-        lines = []
+        all_lines = []
         for v in runners:
             if u == v:
                 continue
@@ -1185,28 +1324,14 @@ def build_html_output(
                 continue
             entries = sorted(
                 entries,
-                key=lambda e: (bool(e.get("is_strict")), e.get("date") if isinstance(e.get("date"), datetime) else datetime.min),
+                key=lambda e: (e.get("route") == "direct", bool(e.get("is_strict")), e.get("date") if isinstance(e.get("date"), datetime) else datetime.min),
                 reverse=True,
             )[:3]
-            v_uma = umaban_dict.get(v, "?")
             for e in entries:
-                sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")))
-                badge = "同条件" if e.get("is_strict") else f"{e.get('place','?')}{e.get('dist','?')}"
-                route = e.get("route", "direct")
-                route_label = "直接" if route == "direct" else f"経由 {route.replace('hidden:', '')}"
-                water = e.get("water")
-                wtxt = f" 水分:{water:.1f}%" if isinstance(water, (int, float)) else ""
-                lines.append(
-                    f"<div style='margin-left:10px;font-size:.86em;line-height:1.55;'>"
-                    f"{html.escape(e.get('date_str',''))} "
-                    f"<span style='display:inline-block;background:#eef3f8;border-radius:999px;padding:1px 7px;margin-right:4px;'>{html.escape(badge)}</span>"
-                    f"<span style='color:#777;'>[{html.escape(route_label)}{html.escape(wtxt)}]</span> "
-                    f"本馬 <span style='color:{c};font-weight:800;'>{sym}</span> [{html.escape(v_uma)}]{html.escape(v)} "
-                    f"<span style='color:{c};'>({e.get('diff',0.0):+.1f}秒換算)</span>"
-                    f" <span style='color:#999;'>{html.escape(e.get('title',''))}</span>"
-                    f"</div>"
-                )
-        hp.append("".join(lines[:12]) if lines else "<div style='margin-left:10px;font-size:.86em;color:#999;'>比較可能な直接・間接データなし</div>")
+                all_lines.append((1 if e.get("route") == "direct" else 0, e.get("date") if isinstance(e.get("date"), datetime) else datetime.min, render_entry(u, v, e)))
+        all_lines.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        lines = [x[2] for x in all_lines]
+        hp.append("".join(lines[:16]) if lines else "<div style='margin-left:10px;font-size:.86em;color:#999;'>比較可能な直接・間接データなし</div>")
         hp.append("</div>")
         return "\n".join(hp)
 
@@ -1231,6 +1356,58 @@ def build_html_output(
             )
     parts.append("</div>")
     return "\n".join(parts)
+
+
+def build_group_direct_html(past_races: List[RaceInfo], umaban_dict: Dict[str, str], is_banei: bool) -> str:
+    """同じ過去レースに現在出走馬が3頭以上出ている直接対決を一覧化。"""
+    current_names = set(umaban_dict.keys())
+    races = []
+    for race in past_races:
+        members = [h for h in race.horses.keys() if h in current_names]
+        if len(members) < 3:
+            continue
+        def rank_key(h: str):
+            r = race.ranks.get(h, "999")
+            return int(r) if str(r).isdigit() else 999
+        members.sort(key=rank_key)
+        races.append((parse_date_any(race.race_date), race, members))
+    races.sort(key=lambda x: x[0], reverse=True)
+
+    if not races:
+        return "<div style='padding:12px;background:#fff;border-radius:8px;border:1px solid #e5e7eb;color:#777;'>同じ過去レースに今回出走馬が3頭以上いた直接対決は見つかりませんでした。</div>"
+
+    out = ["<div style='font-family:-apple-system,BlinkMacSystemFont,Meiryo,sans-serif;font-size:14px;color:#333;'>"]
+    out.append("<p style='color:#555;'>同じ過去レースに今回出走馬が3頭以上出ていたケースです。直接対決を最重要材料として確認できます。</p>")
+    for _, race, members in races:
+        water = f" / 水分:{race.water:.1f}%" if isinstance(race.water, (int, float)) else ""
+        title_link = _safe_link(race.url, f"{race.race_date} {race.title}")
+        out.append(
+            f"<div style='margin:0 0 16px;background:#fff;border:1px solid #e1e7ef;border-radius:8px;overflow:hidden;'>"
+            f"<div style='background:#f7f9fb;padding:10px 12px;font-weight:800;'>🔗 {title_link} "
+            f"<span style='font-weight:400;color:#666;'>({html.escape(race.course)}{html.escape(str(race.distance))}{html.escape(water)})</span></div>"
+        )
+        out.append("<table style='width:100%;border-collapse:collapse;font-size:13px;'>")
+        out.append("<thead><tr style='background:#fbfbfb;'><th>当時着順</th><th>当時馬番</th><th>今回馬番</th><th>馬名</th><th>タイム</th><th>メモ</th></tr></thead><tbody>")
+        first_time = min([race.horses[h] for h in members if race.horses.get(h) is not None], default=None)
+        for h in members:
+            sec = race.horses.get(h)
+            diff = (sec - first_time) if first_time is not None and sec is not None else 0.0
+            rank = race.ranks.get(h, "?")
+            past_umaban = race.horse_numbers.get(h, "?")
+            cur_umaban = umaban_dict.get(h, "?")
+            time_txt = f"{int(sec//60)}:{sec%60:04.1f}" if isinstance(sec, (int, float)) and sec >= 60 else (f"{sec:.1f}" if isinstance(sec, (int, float)) else "")
+            mark = "同レース内最先着" if abs(diff) < 0.01 else f"最先着から+{diff:.1f}秒"
+            out.append(
+                f"<tr><td style='text-align:center;font-weight:800;'>{html.escape(str(rank))}</td>"
+                f"<td style='text-align:center;'>{html.escape(str(past_umaban))}</td>"
+                f"<td style='text-align:center;'>{html.escape(str(cur_umaban))}</td>"
+                f"<td><b>{html.escape(h)}</b></td>"
+                f"<td style='text-align:center;'>{html.escape(time_txt)}</td>"
+                f"<td style='color:#666;'>{html.escape(mark)}</td></tr>"
+            )
+        out.append("</tbody></table></div>")
+    out.append("<style>td,th{border:1px solid #e5e7eb;padding:7px 8px;} th{font-weight:700;}</style></div>")
+    return "\n".join(out)
 
 
 def build_matrix_html(matchup_matrix: Dict[str, Dict[str, str]], umaban_dict: Dict[str, str]) -> str:
@@ -1276,11 +1453,11 @@ def count_edges(G: nx.DiGraph) -> Tuple[int, int]:
 # 6. 統合関数・HTML一括出力
 # ==========================================
 
-def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket: Optional[str]) -> Tuple[str, str, str, Dict[str, Any]]:
+def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket: Optional[str]) -> Tuple[str, str, str, str, Dict[str, Any]]:
     try:
         current, past_races = scraper.fetch_current_and_past(deba_url, water_filter_bucket)
         if not current.umaban_dict:
-            return current.title, "データなし", "", current.debug
+            return current.title, "データなし", "", "", current.debug
         G = build_comparison_graph(past_races, current.target_course, current.target_distance, current.umaban_dict, current.is_banei)
         runners = list(current.umaban_dict.keys())
         pair_net = compute_pairwise_results(G, runners, current.target_course, current.target_distance, current.is_banei)
@@ -1299,6 +1476,7 @@ def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket
             water_filter_bucket,
             current.is_banei,
         )
+        group_direct_html = build_group_direct_html(past_races, current.umaban_dict, current.is_banei)
         matrix_html = build_matrix_html(matchup_matrix, current.umaban_dict)
         direct_edges, hidden_edges = count_edges(G)
         current.debug.update({
@@ -1310,37 +1488,57 @@ def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket
             "ranked": len(ranked),
             "unranked": len(unranked),
         })
-        return current.title, html_out, matrix_html, current.debug
+        return current.title, html_out, group_direct_html, matrix_html, current.debug
     except Exception as e:
-        return "解析エラー", f"<div style='color:#d83a3a;font-weight:bold;'>エラー: {html.escape(str(e))}</div>", "", {"error": str(e), "url": deba_url}
+        return "解析エラー", f"<div style='color:#d83a3a;font-weight:bold;'>エラー: {html.escape(str(e))}</div>", "", "", {"error": str(e), "url": deba_url}
 
 
-def wrap_combined_html(results: List[Tuple[int, str, str, str, Dict[str, Any]]]) -> str:
+def wrap_combined_html(results: List[Tuple[int, str, str, str, str, Dict[str, Any]]]) -> str:
     tabs, contents = "", ""
-    for i, (r_num, title, body, matrix, debug) in enumerate(results):
+    for i, (r_num, title, body, group_direct, matrix, debug) in enumerate(results):
         active = "active" if i == 0 else ""
-        tabs += f'<button class="tab-btn {active}" onclick="openTab(event, \'race_{r_num}\')">{r_num}R</button>\n'
-        debug_html = "<pre>" + html.escape("\n".join(f"{k}: {v}" for k, v in debug.items())) + "</pre>"
-        contents += f"<div id='race_{r_num}' class='tab-content {active}'><h2>📊 {html.escape(title)}</h2>{body}<h3>対戦マトリクス</h3>{matrix}<details><summary>デバッグ情報</summary>{debug_html}</details></div>"
+        tabs += f'<button class="tab-btn {active}" onclick="openRaceTab(event, \'race_{r_num}\')">{r_num}R</button>\n'
+        contents += f"""
+        <div id='race_{r_num}' class='tab-content {active}'>
+          <h2>📊 {html.escape(title)}</h2>
+          <div class='sub-tab-buttons'>
+            <button class='sub-tab-btn active' onclick="openSubTab(event, 'race_{r_num}_rank')">ランク判定</button>
+            <button class='sub-tab-btn' onclick="openSubTab(event, 'race_{r_num}_direct3')">3頭以上直接対決</button>
+            <button class='sub-tab-btn' onclick="openSubTab(event, 'race_{r_num}_matrix')">対戦マトリクス</button>
+          </div>
+          <div id='race_{r_num}_rank' class='sub-tab-content active'>{body}</div>
+          <div id='race_{r_num}_direct3' class='sub-tab-content'>{group_direct}</div>
+          <div id='race_{r_num}_matrix' class='sub-tab-content'><h3>対戦マトリクス</h3>{matrix}</div>
+        </div>
+        """
     return f"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NAR公式 物差し能力比較</title>
 <style>
 body {{ font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif; background:#f7f6f2; padding:20px; }}
 .container {{ background:#fff; padding:20px; border-radius:10px; max-width:1100px; margin:auto; box-shadow:0 2px 10px rgba(0,0,0,.10); }}
-.tab-buttons {{ display:flex; gap:5px; border-bottom:2px solid #3498db; margin-bottom:20px; flex-wrap:wrap; }}
-.tab-btn {{ padding:10px 16px; border:none; background:#ecf0f1; cursor:pointer; font-weight:bold; border-radius:4px 4px 0 0; }}
+.tab-buttons,.sub-tab-buttons {{ display:flex; gap:5px; border-bottom:2px solid #3498db; margin-bottom:16px; flex-wrap:wrap; }}
+.sub-tab-buttons {{ border-bottom-color:#9aa8b8; margin-top:8px; }}
+.tab-btn,.sub-tab-btn {{ padding:10px 16px; border:none; background:#ecf0f1; cursor:pointer; font-weight:bold; border-radius:4px 4px 0 0; }}
 .tab-btn.active {{ background:#3498db; color:white; }}
-.tab-content {{ display:none; }} .tab-content.active {{ display:block; }}
-pre {{ white-space:pre-wrap; background:#f5f5f5; padding:10px; border-radius:6px; font-size:12px; }}
+.sub-tab-btn.active {{ background:#596a7d; color:white; }}
+.tab-content,.sub-tab-content {{ display:none; }} .tab-content.active,.sub-tab-content.active {{ display:block; }}
+a {{ color:#0b65c2; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
 </style></head><body><div class="container"><div class="tab-buttons">{tabs}</div>{contents}</div>
 <script>
-function openTab(evt, id) {{
+function openRaceTab(evt, id) {{
   document.querySelectorAll('.tab-content, .tab-btn').forEach(e => e.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   evt.currentTarget.classList.add('active');
 }}
+function openSubTab(evt, id) {{
+  const parent = evt.currentTarget.closest('.tab-content');
+  parent.querySelectorAll('.sub-tab-content, .sub-tab-btn').forEach(e => e.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  evt.currentTarget.classList.add('active');
+}}
 </script></body></html>"""
+
 
 
 # ==========================================
@@ -1349,14 +1547,14 @@ function openTab(evt, id) {{
 
 st.set_page_config(page_title="NAR公式 物差し能力比較", page_icon="🏇", layout="wide")
 st.title("🏇 NAR公式 物差し能力比較")
-st.caption("地方競馬専用 / JRAモードなし / 出走馬名・過去成績はNAR公式から取得 / ばんえい水分量フィルタ対応 / ばんえい矢印判定は5秒・15秒基準")
+st.caption("地方競馬専用 / NAR公式から取得 / 直接対決を最重要視 / 3頭以上直接対決タブ / ばんえい水分量フィルタ対応")
 
 with st.expander("重要な変更点", expanded=False):
     st.markdown(
         """
 - netkeiba馬柱では、地方・ばんえいで父馬名を拾ってしまうケースがあるため、出走馬名はNAR公式の出馬表から取得します。
 - 過去5走リンクもNAR公式の出馬表から拾い、比較用の全頭結果はNAR公式の成績表（RaceMarkTable）から取得します。
-- ばんえいは水分量を `2.0%未満` / `2.0%以上` に分け、チェック時は比較対象レースも同じ区分だけに絞ります。\n- ばんえいの不等号は一律で `5秒未満=`, `5秒以上15秒未満 >/<`, `15秒以上 >>/<<` です。
+- ばんえいは水分量を `2.0%未満` / `2.0%以上` に分け、チェック時は比較対象レースも同じ区分だけに絞ります。\n- 直接対決は経由比較より大きく重くランクへ反映します。\n- ばんえいの不等号は一律で `5秒未満=`, `5秒以上15秒未満 >/<`, `15秒以上 >>/<<` です。
         """
     )
 
@@ -1402,7 +1600,7 @@ if submitted:
     if not selected_races:
         selected_races = [key.race_no]
 
-    results: List[Tuple[int, str, str, str, Dict[str, Any]]] = []
+    results: List[Tuple[int, str, str, str, str, Dict[str, Any]]] = []
     progress = st.progress(0.0)
     status = st.empty()
 
@@ -1426,8 +1624,8 @@ if submitted:
                     water_bucket_for_race = None
 
         status.info(f"🏇 {rno}R 解析中... 水分量フィルタ={water_bucket_label(water_bucket_for_race)}")
-        title, body, matrix, debug = analyze_race(scraper, deba_url, water_bucket_for_race)
-        results.append((rno, title, body, matrix, debug))
+        title, body, group_direct, matrix, debug = analyze_race(scraper, deba_url, water_bucket_for_race)
+        results.append((rno, title, body, group_direct, matrix, debug))
         progress.progress((idx + 1) / len(selected_races))
 
     status.empty()
@@ -1442,17 +1640,13 @@ if submitted:
     )
 
     tabs = st.tabs([f"{r[0]}R" for r in results])
-    for tab, (r_num, title, body, matrix, debug) in zip(tabs, results):
+    for tab, (r_num, title, body, group_direct, matrix, debug) in zip(tabs, results):
         with tab:
             st.markdown(f"### {title}")
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("出走馬", debug.get("runners", 0))
-            c2.metric("過去リンク", debug.get("past_links", 0))
-            c3.metric("使用過去レース", debug.get("past_races_after_filter", debug.get("past_result_races_used", 0)))
-            c4.metric("直接エッジ", debug.get("direct_edges", 0))
-            c5.metric("水分除外", debug.get("excluded_by_water", 0))
-            st.markdown(body, unsafe_allow_html=True)
-            with st.expander("対戦マトリクス"):
+            sub_tabs = st.tabs(["ランク判定", "3頭以上直接対決", "対戦マトリクス"])
+            with sub_tabs[0]:
+                st.markdown(body, unsafe_allow_html=True)
+            with sub_tabs[1]:
+                st.markdown(group_direct, unsafe_allow_html=True)
+            with sub_tabs[2]:
                 st.markdown(matrix, unsafe_allow_html=True)
-            with st.expander("デバッグ情報"):
-                st.json(debug)
