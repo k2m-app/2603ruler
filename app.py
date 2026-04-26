@@ -12,7 +12,7 @@ import Charts
 import NaturalLanguage
 
 // ==========================================
-// 🎨 テーマカラー
+// テーマカラー
 // ==========================================
 enum ThemeColor: Int, CaseIterable, Identifiable {
     case sageGreen = 0; case dustyRose = 1; case mutedBlue = 2; case warmSand = 3; case lavender = 4
