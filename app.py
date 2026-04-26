@@ -5,7 +5,7 @@ NAR公式サイト専用 物差し能力比較 Streamlit版
 目的:
 - netkeiba側で親馬名を拾ってしまう問題を回避するため、出走馬名・過去走リンク・過去成績をNAR公式から取得する
 - JRAモードなし。地方競馬のみ。ばんえいも対応
-- ばんえいは水分量 2.0% 未満 / 2.0% 以上で過去比較対象を絞れる
+- ばんえいは水分量 2.0% 未満 / 2.0% 以上で過去比較対象を絞れる。矢印判定は5秒/15秒一律
 
 起動:
     pip install streamlit requests beautifulsoup4 networkx
@@ -37,6 +37,7 @@ from urllib3.util.retry import Retry
 # ==========================================
 
 BASE = "https://www.keiba.go.jp"
+NAR_TODAY_BASE = BASE + "/KeibaWeb/TodayRaceInfo/"
 REQUEST_INTERVAL_SEC = 0.22
 
 LOCAL_PLACES = [
@@ -177,7 +178,20 @@ def decode_response(res: requests.Response) -> str:
 
 
 def abs_url(href: str) -> str:
-    return urljoin(BASE, href or "")
+    """NAR公式の相対URLを正しい /KeibaWeb/TodayRaceInfo/ 配下に解決する。
+
+    旧版は urljoin("https://www.keiba.go.jp", "../TodayRaceInfo/...") としていたため、
+    https://www.keiba.go.jp/TodayRaceInfo/... になり、/KeibaWeb が抜けて404になっていた。
+    これが過去レース取得失敗 → 全頭判定不能の主因。
+    """
+    href = (href or "").strip()
+    if not href:
+        return ""
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return urljoin(BASE, href)
+    return urljoin(NAR_TODAY_BASE, href)
 
 
 def href_has(href: str, key: str) -> bool:
@@ -592,6 +606,7 @@ class NarOfficialScraper:
             "horse_rows": len(horse_rows),
             "runners": len(umaban_dict),
             "past_links": len(past_links),
+            "past_links_sample": [pl.url for pl in past_links[:10]],
             "runner_names": list(umaban_dict.keys()),
             "parse_errors": parse_errors[:20],
         }
@@ -728,10 +743,15 @@ class NarOfficialScraper:
 # ==========================================
 
 def thresholds(is_banei: bool, is_strict: bool) -> Tuple[float, float]:
-    """draw_th, strong_th。diff>0なら本馬優勢。"""
-    # ばんえいは秒差が大きく出やすいため、平地地方より閾値を広くする
+    """draw_th, strong_th。diff>0なら本馬優勢。
+
+    ばんえいはユーザー指定どおり一律:
+      - 5秒未満: =
+      - 5秒以上15秒未満: > / <
+      - 15秒以上: >> / <<
+    """
     if is_banei:
-        return (2.0, 6.0) if is_strict else (3.0, 8.0)
+        return (5.0, 15.0)
     return (0.8, 2.0) if is_strict else (1.2, 3.0)
 
 
@@ -755,7 +775,7 @@ def build_comparison_graph(
             h1, h2 = h2, h1
             raw_diff_seconds = -raw_diff_seconds
 
-        cap = 15.0 if is_banei else 8.0
+        cap = 30.0 if is_banei else 8.0
         capped = max(-cap, min(cap, raw_diff_seconds))
         r_dist = int(race.distance) if str(race.distance).isdigit() else 0
         is_same_place = race.course == target_course
@@ -1329,14 +1349,14 @@ function openTab(evt, id) {{
 
 st.set_page_config(page_title="NAR公式 物差し能力比較", page_icon="🏇", layout="wide")
 st.title("🏇 NAR公式 物差し能力比較")
-st.caption("地方競馬専用 / JRAモードなし / 出走馬名・過去成績はNAR公式から取得 / ばんえい水分量フィルタ対応")
+st.caption("地方競馬専用 / JRAモードなし / 出走馬名・過去成績はNAR公式から取得 / ばんえい水分量フィルタ対応 / ばんえい矢印判定は5秒・15秒基準")
 
 with st.expander("重要な変更点", expanded=False):
     st.markdown(
         """
 - netkeiba馬柱では、地方・ばんえいで父馬名を拾ってしまうケースがあるため、出走馬名はNAR公式の出馬表から取得します。
 - 過去5走リンクもNAR公式の出馬表から拾い、比較用の全頭結果はNAR公式の成績表（RaceMarkTable）から取得します。
-- ばんえいは水分量を `2.0%未満` / `2.0%以上` に分け、チェック時は比較対象レースも同じ区分だけに絞ります。
+- ばんえいは水分量を `2.0%未満` / `2.0%以上` に分け、チェック時は比較対象レースも同じ区分だけに絞ります。\n- ばんえいの不等号は一律で `5秒未満=`, `5秒以上15秒未満 >/<`, `15秒以上 >>/<<` です。
         """
     )
 
