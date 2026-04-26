@@ -1,1652 +1,1059 @@
-# -*- coding: utf-8 -*-
-"""
-NAR公式サイト専用 物差し能力比較 Streamlit版
-
-目的:
-- netkeiba側で親馬名を拾ってしまう問題を回避するため、出走馬名・過去走リンク・過去成績をNAR公式から取得する
-- JRAモードなし。地方競馬のみ。ばんえいも対応
-- ばんえいは水分量 2.0% 未満 / 2.0% 以上で過去比較対象を絞れる。矢印判定は5秒/15秒一律
-
-起動:
-    pip install streamlit requests beautifulsoup4 networkx
-    streamlit run nar_official_relative_app.py
-
-入力URL例:
-    https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2f04%2f26&k_raceNo=1&k_babaCode=3
-"""
-
-from __future__ import annotations
-
-import html
-import re
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
-
-import networkx as nx
-import requests
-import streamlit as st
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# ==========================================
-# 0. 定数・ユーティリティ
-# ==========================================
-
-BASE = "https://www.keiba.go.jp"
-NAR_TODAY_BASE = BASE + "/KeibaWeb/TodayRaceInfo/"
-REQUEST_INTERVAL_SEC = 0.22
-
-LOCAL_PLACES = [
-    "帯広", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎",
-    "金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀",
-]
-# NAR表示では「帯 広」のように空白が入ることがあるので、正規化後の文字列で探す
-PLACE_RE = re.compile("(" + "|".join(map(re.escape, LOCAL_PLACES)) + ")")
-TIME_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}\.\d|\d{1,3}\.\d)(?!\d)")
-
-
-def clean_text(x: Any) -> str:
-    if x is None:
-        return ""
-    if hasattr(x, "get_text"):
-        s = x.get_text(" ", strip=True)
-    else:
-        s = str(x)
-    s = html.unescape(s)
-    s = s.replace("\xa0", " ").replace("\u3000", " ")
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def normalize_name(name: str) -> str:
-    """馬名の比較用。NARは馬名リンクに空白が混ざることがあるので落とす。"""
-    s = html.unescape(str(name or ""))
-    s = s.replace("\xa0", "").replace("\u3000", "")
-    s = re.sub(r"\s+", "", s)
-    return s.strip()
-
-
-def normalize_place_text(text: str) -> str:
-    """NARの『帯 広』のような表示を『帯広』に寄せる。"""
-    s = clean_text(text)
-    # 地名の間にだけ入りがちな半角/全角スペースを落とす
-    compact = re.sub(r"\s+", "", s)
-    return compact
-
-
-def extract_place(text: str) -> str:
-    compact = normalize_place_text(text)
-    m = PLACE_RE.search(compact)
-    return m.group(1) if m else "不明"
-
-
-def extract_distance(text: str) -> str:
-    s = clean_text(text)
-    # NARは 200ｍ / ダート 1400ｍ / 直200 のような表記
-    m = re.search(r"(\d{3,4})\s*[mｍ]", s)
-    if m:
-        return m.group(1)
-    m = re.search(r"(?:直|ダ|芝)\s*(\d{3,4})", s)
-    if m:
-        return m.group(1)
-    return "不明"
-
-
-def extract_water(text: str) -> Optional[float]:
-    s = clean_text(text)
-    m = re.search(r"馬場\s*[:：]\s*(\d+(?:\.\d+)?)", s)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    # 出馬表の過去走欄では 26.04.20 0.8 8頭 のように水分量が日付直後に入る
-    m = re.search(r"\d{2,4}[./]\d{1,2}[./]\d{1,2}\s+(\d+(?:\.\d+)?)\s+\d+頭", s)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def water_bucket(w: Optional[float]) -> Optional[str]:
-    if w is None:
-        return None
-    return "lt2" if w < 2.0 else "ge2"
-
-
-def water_bucket_label(bucket: Optional[str]) -> str:
-    if bucket == "lt2":
-        return "2.0%未満"
-    if bucket == "ge2":
-        return "2.0%以上"
-    return "指定なし"
-
-
-def convert_time_to_sec(time_str: str) -> Optional[float]:
-    if not time_str:
-        return None
-    m = TIME_RE.search(str(time_str))
-    if not m:
-        return None
-    token = m.group(1)
-    try:
-        if ":" in token:
-            mm, ss = token.split(":", 1)
-            return int(mm) * 60 + float(ss)
-        return float(token)
-    except Exception:
-        return None
-
-
-def parse_date_any(text: str) -> datetime:
-    s = clean_text(text)
-    # 2026年4月20日
-    m = re.search(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日", s)
-    if m:
-        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    # 2026/04/20, 2026.04.20, 26.04.20
-    m = re.search(r"(\d{2,4})[./-](\d{1,2})[./-](\d{1,2})", s)
-    if m:
-        yy = int(m.group(1))
-        if yy < 100:
-            yy += 2000
-        return datetime(yy, int(m.group(2)), int(m.group(3)))
-    return datetime.min
-
-
-def date_to_nar(date: datetime) -> str:
-    return f"{date.year:04d}/{date.month:02d}/{date.day:02d}"
-
-
-def decode_response(res: requests.Response) -> str:
-    raw = res.content or b""
-    candidates: List[str] = []
-    for enc in [res.encoding, res.apparent_encoding, "EUC-JP", "cp932", "shift_jis", "utf-8"]:
-        if enc and enc not in candidates:
-            candidates.append(enc)
-    for enc in candidates:
-        try:
-            return raw.decode(enc, errors="strict")
-        except Exception:
-            pass
-    return raw.decode("cp932", errors="replace")
-
-
-def abs_url(href: str) -> str:
-    """NAR公式の相対URLを正しい /KeibaWeb/TodayRaceInfo/ 配下に解決する。
-
-    旧版は urljoin("https://www.keiba.go.jp", "../TodayRaceInfo/...") としていたため、
-    https://www.keiba.go.jp/TodayRaceInfo/... になり、/KeibaWeb が抜けて404になっていた。
-    これが過去レース取得失敗 → 全頭判定不能の主因。
-    """
-    href = (href or "").strip()
-    if not href:
-        return ""
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("/"):
-        return urljoin(BASE, href)
-    return urljoin(NAR_TODAY_BASE, href)
-
-
-def href_has(href: str, key: str) -> bool:
-    return key.lower() in (href or "").lower()
-
-
-def qparam(url: str, key: str) -> Optional[str]:
-    qs = parse_qs(urlparse(url).query)
-    vals = qs.get(key)
-    return vals[0] if vals else None
-
-
-# ==========================================
-# 1. コース形態判定
-# ==========================================
-
-def is_ooi_inner(dist: Any) -> bool:
-    d = int(dist) if str(dist).isdigit() else 0
-    return d in (1500, 1600, 1650)
-
-
-def is_ooi_outer(dist: Any) -> bool:
-    d = int(dist) if str(dist).isdigit() else 0
-    return d > 0 and d not in (1500, 1600, 1650)
-
-
-def is_one_turn(place: str, dist: Any) -> bool:
-    d = int(dist) if str(dist).isdigit() else 0
-    if place == "川崎" and d == 900:
-        return True
-    if place == "浦和" and d == 800:
-        return True
-    if place == "船橋" and d in (1000, 1200):
-        return True
-    if place == "大井" and d in (1000, 1200, 1400):
-        return True
-    if place == "門別" and d <= 1000:
-        return True
-    if place == "盛岡" and d <= 1000:
-        return True
-    return False
-
-
-def get_track_layout(place: str, dist: Any) -> str:
-    d = int(dist) if str(dist).isdigit() else 0
-    if place == "帯広":
-        return "banei"
-    if place == "大井":
-        if d <= 1400:
-            return "outer_1turn"
-        if d <= 1650:
-            return "inner_2turn"
-        return "outer_2turn"
-    if place == "川崎":
-        if d == 900:
-            return "1turn"
-        if d <= 1600:
-            return "2turn"
-        return "multi"
-    if place == "船橋":
-        if d <= 1200:
-            return "1turn"
-        if d <= 1800:
-            return "2turn"
-        return "multi"
-    if place == "浦和":
-        if d <= 800:
-            return "1turn"
-        if d <= 1500:
-            return "2turn"
-        return "multi"
-    if place == "門別":
-        if d <= 1000:
-            return "short"
-        if d <= 1700:
-            return "mid"
-        return "long"
-    if place == "盛岡":
-        if d <= 1000:
-            return "short"
-        if d <= 1600:
-            return "mid"
-        return "long"
-    if place == "水沢":
-        if d <= 1400:
-            return "short"
-        return "standard"
-    if place in ("金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀"):
-        if d <= 1200:
-            return "short"
-        if d <= 1600:
-            return "mid"
-        return "long"
-    if d <= 1200:
-        return "short"
-    if d <= 1800:
-        return "mid"
-    return "long"
-
-
-def is_same_track_layout(place: str, dist1: Any, dist2: Any) -> bool:
-    return get_track_layout(place, dist1) == get_track_layout(place, dist2)
-
-
-# ==========================================
-# 2. データ構造
-# ==========================================
-
-@dataclass(frozen=True)
-class NarRaceKey:
-    race_date: str  # YYYY/MM/DD
-    race_no: int
-    baba_code: str
-
-
-@dataclass
-class PastLink:
-    current_horse: str
-    url: str
-    race_date: str
-    race_no: int
-    baba_code: str
-    # DebaTableの過去走欄（例: 26.04.20 0.8 8頭 / 帯広 直200 8番）から先読みした情報。
-    # RaceMarkTable側のヘッダでも再取得するが、水分量フィルタはここでも判定できるようにする。
-    date_hint: datetime = datetime.min
-    water_hint: Optional[float] = None
-    course_hint: str = "不明"
-    distance_hint: str = "不明"
-
-
-@dataclass
-class RaceInfo:
-    url: str
-    race_date: str = ""
-    race_no: int = 0
-    title: str = ""
-    course: str = "不明"
-    distance: str = "不明"
-    water: Optional[float] = None
-    horses: Dict[str, float] = field(default_factory=dict)  # horse_name -> seconds
-    ranks: Dict[str, str] = field(default_factory=dict)
-    horse_numbers: Dict[str, str] = field(default_factory=dict)  # horse_name -> 馬番（その過去レース時点）
-    source_current_horses: List[str] = field(default_factory=list)
-    fetched: bool = False
-
-
-@dataclass
-class CurrentRaceData:
-    key: NarRaceKey
-    title: str
-    target_course: str
-    target_distance: str
-    target_water: Optional[float]
-    is_banei: bool
-    umaban_dict: Dict[str, str]
-    past_links: List[PastLink]
-    debug: Dict[str, Any]
-
-
-# ==========================================
-# 3. NAR公式スクレイパー
-# ==========================================
-
-class NarOfficialScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        retries = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET",),
-            raise_on_status=False,
-        )
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            ),
-            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-            "Referer": "https://www.keiba.go.jp/",
-        })
-        self.result_cache: Dict[str, RaceInfo] = {}
-
-    def get_html(self, url: str, timeout: int = 15) -> str:
-        time.sleep(REQUEST_INTERVAL_SEC)
-        res = self.session.get(url, timeout=timeout)
-        res.raise_for_status()
-        return decode_response(res)
-
-    def parse_key_from_url(self, url: str) -> Optional[NarRaceKey]:
-        qs = parse_qs(urlparse(url).query)
-        race_date = (qs.get("k_raceDate") or [None])[0]
-        race_no = (qs.get("k_raceNo") or [None])[0]
-        baba_code = (qs.get("k_babaCode") or [None])[0]
-        if not (race_date and race_no and baba_code):
-            return None
-        race_date = race_date.replace("-", "/")
-        return NarRaceKey(race_date=race_date, race_no=int(race_no), baba_code=str(baba_code))
-
-    def build_deba_url(self, key: NarRaceKey) -> str:
-        params = urlencode({
-            "k_raceDate": key.race_date,
-            "k_raceNo": key.race_no,
-            "k_babaCode": key.baba_code,
-        })
-        return f"{BASE}/KeibaWeb/TodayRaceInfo/DebaTable?{params}"
-
-    def build_racemark_url(self, race_date: str, race_no: int, baba_code: str) -> str:
-        params = urlencode({
-            "k_raceDate": race_date,
-            "k_raceNo": race_no,
-            "k_babaCode": baba_code,
-        })
-        return f"{BASE}/KeibaWeb/TodayRaceInfo/RaceMarkTable?{params}"
-
-    def parse_page_meta(self, soup: BeautifulSoup, fallback_key: Optional[NarRaceKey] = None) -> Dict[str, Any]:
-        text = clean_text(soup)
-        compact = normalize_place_text(text)
-        course = extract_place(compact)
-        distance = extract_distance(text)
-        water = extract_water(text)
-        dt = parse_date_any(text)
-
-        title = ""
-        # NARの出馬表は h3 にレース名が入ることが多い。ヘルプ見出し等は避ける。
-        for h in soup.find_all(["h2", "h3", "h4"]):
-            t = clean_text(h)
-            if not t:
-                continue
-            if any(skip in t for skip in ["オッズ", "出馬表の見方", "地方競馬情報サイト"]):
-                continue
-            # 日付やサイト名ではなく、レース名らしいものを採用
-            if "競走" not in t and len(t) >= 3:
-                title = t
-                break
-        if not title:
-            # RaceMarkTableではレース名が span.plus1bold02 に入る。
-            sp = soup.find("span", class_="plus1bold02")
-            if sp:
-                title = clean_text(sp)
-        if not title:
-            # RaceMarkTableではhタグに無いケースがあるため、ヘッダ直後の短い行を保険で拾う
-            lines = [x.strip() for x in soup.get_text("\n", strip=True).split("\n") if x.strip()]
-            for idx, line in enumerate(lines):
-                if "天候" in line and "馬場" in line and idx + 1 < len(lines):
-                    title = lines[idx + 1]
-                    break
-        if not title:
-            title = "レース名不明"
-
-        if fallback_key:
-            date_str = fallback_key.race_date
-            race_no = fallback_key.race_no
-            baba_code = fallback_key.baba_code
-        else:
-            date_str = date_to_nar(dt) if dt != datetime.min else ""
-            race_no = 0
-            baba_code = ""
-
-        return {
-            "title": title,
-            "course": course,
-            "distance": distance,
-            "water": water,
-            "date": dt,
-            "date_str": date_to_nar(dt) if dt != datetime.min else date_str,
-            "race_no": race_no,
-            "baba_code": baba_code,
+import SwiftUI
+import SwiftData
+import HealthKit
+import Combine
+import UserNotifications
+import PhotosUI
+import UIKit
+import CoreLocation
+import UniformTypeIdentifiers
+import MapKit
+import Charts
+import NaturalLanguage
+
+// ==========================================
+// 🎨 テーマカラー
+// ==========================================
+enum ThemeColor: Int, CaseIterable, Identifiable {
+    case sageGreen = 0; case dustyRose = 1; case mutedBlue = 2; case warmSand = 3; case lavender = 4
+    var id: Int { self.rawValue }
+    var color: Color {
+        switch self {
+        case .sageGreen: return Color(red: 132/255, green: 165/255, blue: 157/255)
+        case .dustyRose: return Color(red: 205/255, green: 144/255, blue: 144/255)
+        case .mutedBlue: return Color(red: 138/255, green: 164/255, blue: 183/255)
+        case .warmSand:  return Color(red: 212/255, green: 163/255, blue: 115/255)
+        case .lavender:  return Color(red: 168/255, green: 159/255, blue: 180/255)
         }
-
-    def _row_has_current_horse_link(self, row) -> bool:
-        return any(href_has(a.get("href", ""), "DataRoom/HorseMarkInfo") for a in row.find_all("a", href=True))
-
-    def _row_race_links(self, row) -> List[str]:
-        urls: List[str] = []
-        for a in row.find_all("a", href=True):
-            href = a.get("href", "")
-            if href_has(href, "TodayRaceInfo/RaceMarkTable"):
-                u = abs_url(href)
-                if u not in urls:
-                    urls.append(u)
-        return urls
-
-    def _extract_umaban_from_row(self, row, horse_name: str, fallback_no: int) -> str:
-        row_text = clean_text(row)
-        prefix = row_text.split(clean_text(horse_name))[0]
-        nums = re.findall(r"(?<![\d.])\d{1,2}(?![\d.])", prefix)
-        if nums:
-            return nums[-1]
-        # cellベースの保険
-        cells = [clean_text(td) for td in row.find_all(["td", "th"])]
-        small_nums = [c for c in cells[:5] if re.fullmatch(r"\d{1,2}", c)]
-        if small_nums:
-            return small_nums[-1]
-        return str(fallback_no)
-
-    def parse_current_deba(self, url: str) -> CurrentRaceData:
-        key = self.parse_key_from_url(url)
-        if not key:
-            raise ValueError("NAR公式URLから k_raceDate / k_raceNo / k_babaCode を抽出できませんでした。")
-        canonical_url = self.build_deba_url(key)
-        text = self.get_html(canonical_url)
-        soup = BeautifulSoup(text, "html.parser")
-        meta = self.parse_page_meta(soup, fallback_key=key)
-
-        rows = soup.find_all("tr")
-        horse_rows: List[Tuple[int, Any]] = []
-        for idx, row in enumerate(rows):
-            if self._row_has_current_horse_link(row):
-                # 競走馬行以外の馬情報欄を避けるため、RaceMarkTableリンクまたは馬番らしき数字がある行を採用
-                row_text = clean_text(row)
-                if self._row_race_links(row) or re.search(r"^\s*\d+\s+\d+\s+", row_text):
-                    horse_rows.append((idx, row))
-
-        umaban_dict: Dict[str, str] = {}
-        past_links: List[PastLink] = []
-        parse_errors: List[str] = []
-        seen_horses = set()
-
-        for order, (idx, row) in enumerate(horse_rows, start=1):
-            horse_link = None
-            for a in row.find_all("a", href=True):
-                if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
-                    horse_link = a
-                    break
-            if not horse_link:
-                continue
-            horse_name = normalize_name(clean_text(horse_link))
-            if not horse_name or horse_name in seen_horses:
-                continue
-            seen_horses.add(horse_name)
-
-            umaban = self._extract_umaban_from_row(row, horse_name, order)
-            umaban_dict[horse_name] = umaban
-
-            # NAR公式の出馬表は、馬名行に「過去5走のraceInfo」、次行に「RaceMarkTableリンク」が並ぶ構造。
-            # 例: 26.04.20 0.8 8頭 / 帯広 直200 8番 → 真ん中の0.8がばんえいの水分量。
-            block_rows = [row]
-            j = idx + 1
-            while j < len(rows) and not self._row_has_current_horse_link(rows[j]):
-                block_rows.append(rows[j])
-                j += 1
-
-            info_nodes = []
-            urls: List[str] = []
-            for br in block_rows:
-                info_nodes.extend(br.find_all("div", class_="raceInfo"))
-                urls.extend(self._row_race_links(br))
-            urls = list(dict.fromkeys(urls))[:5]
-
-            # info_nodesとurlsは通常同じ並びになる。ズレてもURL側を優先し、ヒントだけ空にする。
-            past_hints: List[Dict[str, Any]] = []
-            for node in info_nodes[:5]:
-                itxt = clean_text(node)
-                past_hints.append({
-                    "date_hint": parse_date_any(itxt),
-                    "water_hint": extract_water(itxt),
-                    "course_hint": extract_place(itxt),
-                    "distance_hint": extract_distance(itxt),
-                    "raw": itxt,
-                })
-
-            if not urls:
-                parse_errors.append(f"{horse_name}: 過去走リンクなし")
-
-            for pos, u in enumerate(urls):
-                race_date = qparam(u, "k_raceDate") or ""
-                race_no = qparam(u, "k_raceNo") or "0"
-                baba_code = qparam(u, "k_babaCode") or key.baba_code
-                try:
-                    rn = int(race_no)
-                except Exception:
-                    rn = 0
-                hint = past_hints[pos] if pos < len(past_hints) else {}
-                past_links.append(
-                    PastLink(
-                        current_horse=horse_name,
-                        url=u,
-                        race_date=race_date.replace("-", "/"),
-                        race_no=rn,
-                        baba_code=str(baba_code),
-                        date_hint=hint.get("date_hint", datetime.min),
-                        water_hint=hint.get("water_hint"),
-                        course_hint=hint.get("course_hint", "不明"),
-                        distance_hint=hint.get("distance_hint", "不明"),
-                    )
-                )
-
-        # まれにtable構造が拾えない場合の最終保険。aタグ順から馬名だけは拾う。
-        if not umaban_dict:
-            horse_links = []
-            for a in soup.find_all("a", href=True):
-                if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
-                    nm = normalize_name(clean_text(a))
-                    if nm and nm not in horse_links:
-                        horse_links.append(nm)
-            for i, nm in enumerate(horse_links, start=1):
-                umaban_dict[nm] = str(i)
-            parse_errors.append("table行解析に失敗したため、HorseMarkInfoリンク順で馬名のみ取得しました。")
-
-        is_banei = meta["course"] == "帯広" or key.baba_code == "3" or "ばんえい" in clean_text(soup)
-        debug = {
-            "deba_url": canonical_url,
-            "title": meta["title"],
-            "target_course": meta["course"],
-            "target_distance": meta["distance"],
-            "target_water": meta["water"],
-            "target_water_bucket": water_bucket_label(water_bucket(meta["water"])),
-            "is_banei": is_banei,
-            "horse_rows": len(horse_rows),
-            "runners": len(umaban_dict),
-            "past_links": len(past_links),
-            "past_links_sample": [pl.url for pl in past_links[:10]],
-            "runner_names": list(umaban_dict.keys()),
-            "parse_errors": parse_errors[:20],
+    }
+    var name: String {
+        switch self {
+        case .sageGreen: return "セージグリーン"; case .dustyRose: return "ダスティローズ"; case .mutedBlue: return "ミュートブルー"; case .warmSand: return "ウォームサンド"; case .lavender: return "ラベンダーグレー"
         }
-        return CurrentRaceData(
-            key=key,
-            title=meta["title"],
-            target_course=meta["course"],
-            target_distance=meta["distance"],
-            target_water=meta["water"],
-            is_banei=is_banei,
-            umaban_dict=umaban_dict,
-            past_links=past_links,
-            debug=debug,
-        )
+    }
+}
 
-    def parse_result_table(self, url: str, hint: Optional[PastLink] = None) -> RaceInfo:
-        if url in self.result_cache:
-            race = self.result_cache[url]
-            # 初回取得時にRaceMarkTable側で水分量が取れなかった場合だけ、DebaTableのヒントで補完。
-            if hint is not None and race.water is None:
-                race.water = hint.water_hint
-            return race
-
-        key = self.parse_key_from_url(url)
-        text = self.get_html(url)
-        soup = BeautifulSoup(text, "html.parser")
-        meta = self.parse_page_meta(soup, fallback_key=key)
-
-        race = RaceInfo(
-            url=url,
-            race_date=meta["date_str"],
-            race_no=meta["race_no"],
-            title=meta["title"],
-            course=meta["course"],
-            distance=meta["distance"],
-            water=meta["water"],
-            fetched=True,
-        )
-        if hint is not None:
-            if race.water is None:
-                race.water = hint.water_hint
-            if race.course == "不明" and hint.course_hint != "不明":
-                race.course = hint.course_hint
-            if race.distance == "不明" and hint.distance_hint != "不明":
-                race.distance = hint.distance_hint
-            if (not race.race_date) and hint.date_hint != datetime.min:
-                race.race_date = date_to_nar(hint.date_hint)
-
-        for row in soup.find_all("tr"):
-            horse_link = None
-            for a in row.find_all("a", href=True):
-                if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
-                    horse_link = a
-                    break
-            if not horse_link:
-                continue
-            horse_name = normalize_name(clean_text(horse_link))
-            if not horse_name:
-                continue
-            row_text = clean_text(row)
-            sec = convert_time_to_sec(row_text)
-            if sec is None:
-                # 取消・中止などは比較不能
-                continue
-
-            cells = row.find_all("td")
-            # RaceMarkTableは通常: 0着順 / 1枠番 / 2馬番 / 3馬名 / ... / 11タイム
-            rank = clean_text(cells[0]) if len(cells) > 0 else ""
-            umaban_at_race = clean_text(cells[2]) if len(cells) > 2 else ""
-            if not re.fullmatch(r"\d{1,2}", rank):
-                prefix = row_text.split(clean_text(horse_link))[0]
-                m = re.search(r"(?<![\d.])(\d{1,2})(?![\d.])", prefix)
-                rank = m.group(1) if m else ""
-            if not re.fullmatch(r"\d{1,2}", umaban_at_race):
-                umaban_at_race = ""
-
-            race.horses[horse_name] = sec
-            if rank:
-                race.ranks[horse_name] = rank
-            if umaban_at_race:
-                race.horse_numbers[horse_name] = umaban_at_race
-
-        self.result_cache[url] = race
-        return race
-
-    def fetch_current_and_past(self, deba_url: str, water_filter_bucket: Optional[str]) -> Tuple[CurrentRaceData, List[RaceInfo]]:
-        current = self.parse_current_deba(deba_url)
-        race_by_url: Dict[str, RaceInfo] = {}
-        excluded_by_water: List[str] = []
-        failed_results: List[str] = []
-
-        # 出走馬ごとの過去リンクをfetchし、同じ過去レースは1つに統合。
-        # ばんえい水分量フィルタは、まずDebaTableのraceInfoヒントで先に除外し、
-        # RaceMarkTable取得後にもヘッダの馬場水分で再チェックする。
-        for pl in current.past_links:
-            if current.is_banei and water_filter_bucket:
-                hb = water_bucket(pl.water_hint)
-                if hb is not None and hb != water_filter_bucket:
-                    excluded_by_water.append(
-                        f"{pl.race_date} {pl.current_horse} 水分量={pl.water_hint}({water_bucket_label(hb)}) ※出馬表過去走欄で除外"
-                    )
-                    continue
-
-            try:
-                race = self.parse_result_table(pl.url, hint=pl)
-            except Exception as e:
-                failed_results.append(f"{pl.current_horse}: {pl.url} / {e}")
-                continue
-
-            # 現在馬がそのレース結果内にいない場合は、馬名表記ズレまたは行取得ミスなので使わない
-            if pl.current_horse not in race.horses:
-                failed_results.append(f"{pl.current_horse}: 過去結果に該当馬名なし / {race.title}")
-                continue
-
-            if current.is_banei and water_filter_bucket:
-                rb = water_bucket(race.water)
-                if rb != water_filter_bucket:
-                    excluded_by_water.append(
-                        f"{race.race_date} {race.title} 水分量={race.water}({water_bucket_label(rb)}) ※成績表ヘッダで除外"
-                    )
-                    continue
-
-            if pl.url not in race_by_url:
-                race_by_url[pl.url] = race
-            if pl.current_horse not in race_by_url[pl.url].source_current_horses:
-                race_by_url[pl.url].source_current_horses.append(pl.current_horse)
-
-        current.debug.update({
-            "past_result_races_used": len(race_by_url),
-            "past_result_fetch_failed": len(failed_results),
-            "failed_results_sample": failed_results[:20],
-            "water_filter": water_bucket_label(water_filter_bucket),
-            "excluded_by_water": len(excluded_by_water),
-            "excluded_by_water_sample": excluded_by_water[:20],
-        })
-        return current, list(race_by_url.values())
-
-
-# ==========================================
-# 4. 比較グラフ
-# ==========================================
-
-def thresholds(is_banei: bool, is_strict: bool) -> Tuple[float, float]:
-    """draw_th, strong_th。diff>0なら本馬優勢。
-
-    ばんえいはユーザー指定どおり一律:
-      - 5秒未満: =
-      - 5秒以上15秒未満: > / <
-      - 15秒以上: >> / <<
-    """
-    if is_banei:
-        return (5.0, 15.0)
-    return (0.8, 2.0) if is_strict else (1.2, 3.0)
-
-
-def build_comparison_graph(
-    past_races: List[RaceInfo],
-    target_course: str,
-    target_distance: str,
-    umaban_dict: Dict[str, str],
-    is_banei: bool,
-) -> nx.DiGraph:
-    runners = list(umaban_dict.keys())
-    current_names = set(runners)
-    cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
-    G = nx.DiGraph()
-
-    def add_edge(h1: str, h2: str, raw_diff_seconds: float, race: RaceInfo, is_direct: bool):
-        if not h1 or not h2 or h1 == h2:
-            return
-        # 格納キーを文字列順で正規化。raw_diffは key0_time - key1_time に合わせる。
-        if str(h1) > str(h2):
-            h1, h2 = h2, h1
-            raw_diff_seconds = -raw_diff_seconds
-
-        cap = 30.0 if is_banei else 8.0
-        capped = max(-cap, min(cap, raw_diff_seconds))
-        r_dist = int(race.distance) if str(race.distance).isdigit() else 0
-        is_same_place = race.course == target_course
-        is_exact = is_same_place and r_dist == cur_dist
-        is_same_layout = is_same_track_layout(race.course, race.distance, target_distance)
-        badge = "[場×距]" if is_exact else "[場]" if is_same_place else "[距]" if r_dist == cur_dist else ""
-
-        history = {
-            "date": parse_date_any(race.race_date),
-            "date_str": race.race_date,
-            "place": race.course,
-            "dist": race.distance,
-            "water": race.water,
-            "raw_diff": capped,
-            "badge": badge,
-            "url": race.url,
-            "title": race.title,
-            "is_direct": is_direct,
-            "is_exact": is_exact,
-            "is_same_layout": is_same_layout,
-            "rank_a": race.ranks.get(h1, ""),
-            "rank_b": race.ranks.get(h2, ""),
-            "umaban_a": race.horse_numbers.get(h1, ""),
-            "umaban_b": race.horse_numbers.get(h2, ""),
-        }
-        if G.has_edge(h1, h2):
-            ed = G[h1][h2]
-            ed["history"].append(history)
-            ed["diffs"].append(capped)
-            ed["rank_diff"] = sum(ed["diffs"]) / len(ed["diffs"])
-        else:
-            G.add_edge(h1, h2, history=[history], diffs=[capped], rank_diff=capped)
-
-    for race in past_races:
-        h_list = [(h, t) for h, t in race.horses.items() if t is not None]
-        if not h_list:
-            continue
-        current_in_race = [(h, t) for h, t in h_list if h in current_names]
-        if not current_in_race:
-            continue
-
-        # 現在出走馬同士が同じ過去レースに出ていれば直接対決
-        if len(current_in_race) >= 2:
-            for i in range(len(current_in_race)):
-                for j in range(i + 1, len(current_in_race)):
-                    h1, t1 = current_in_race[i]
-                    h2, t2 = current_in_race[j]
-                    add_edge(h1, h2, t1 - t2, race, True)
-
-        # 現在出走馬 vs 隠れ馬、隠れ馬同士。後段で物差し経由に使う。
-        hidden_horses = [(h, t) for h, t in h_list if h not in current_names]
-        for curr_name, curr_time in current_in_race:
-            for hid_name, hid_time in hidden_horses:
-                add_edge(curr_name, hid_name, curr_time - hid_time, race, False)
-        for i in range(len(hidden_horses)):
-            for j in range(i + 1, len(hidden_horses)):
-                h1, t1 = hidden_horses[i]
-                h2, t2 = hidden_horses[j]
-                add_edge(h1, h2, t1 - t2, race, False)
-
-    # 同一URL重複を除去し、最新順に最大5件
-    for _, _, d in G.edges(data=True):
-        d["history"].sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
-        seen = set()
-        deduped = []
-        for hi in d["history"]:
-            key = hi.get("url") or (hi.get("date_str"), hi.get("title"))
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(hi)
-        d["history"] = deduped[:5]
-        d["diffs"] = [hi["raw_diff"] for hi in d["history"]]
-        d["rank_diff"] = sum(d["diffs"]) / len(d["diffs"]) if d["diffs"] else 0.0
-
-    return G
-
-
-def advantage_entries_from_edge(G: nx.DiGraph, u: str, v: str) -> List[Dict[str, Any]]:
-    """uから見たvへの優劣。diff>0ならu優勢。"""
-    a, b = (u, v) if str(u) < str(v) else (v, u)
-    if not G.has_edge(a, b):
-        return []
-    out = []
-    for hi in G[a][b]["history"]:
-        # raw_diff = a_time - b_time。u==aなら速いほど負なので反転。
-        diff = -hi["raw_diff"] if u == a else hi["raw_diff"]
-        item = dict(hi)
-        item["diff"] = diff
-        if u == a:
-            item["self_rank"] = hi.get("rank_a", "")
-            item["self_umaban"] = hi.get("umaban_a", "")
-            item["opp_rank"] = hi.get("rank_b", "")
-            item["opp_umaban"] = hi.get("umaban_b", "")
-        else:
-            item["self_rank"] = hi.get("rank_b", "")
-            item["self_umaban"] = hi.get("umaban_b", "")
-            item["opp_rank"] = hi.get("rank_a", "")
-            item["opp_umaban"] = hi.get("umaban_a", "")
-        out.append(item)
-    return out
-
-
-def compute_pairwise_results(
-    G: nx.DiGraph,
-    runners: List[str],
-    target_course: str,
-    target_distance: str,
-    is_banei: bool,
-) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-    current_names = set(runners)
-    cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
-    pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]] = {u: {v: [] for v in runners} for u in runners}
-
-    for u in runners:
-        for v in runners:
-            if u == v:
-                continue
-            direct = advantage_entries_from_edge(G, u, v)
-            if direct:
-                same_cond, other = [], []
-                for hi in direct:
-                    place = hi.get("place", "")
-                    dist = hi.get("dist", "")
-                    if is_one_turn(target_course, cur_dist) and not is_one_turn(place, dist):
-                        continue
-                    dist_int = int(dist) if str(dist).isdigit() else 0
-                    entry = {
-                        "diff": hi["diff"],
-                        "is_strict": place == target_course and dist_int == cur_dist,
-                        "place": place,
-                        "dist": dist,
-                        "water": hi.get("water"),
-                        "date": hi.get("date", datetime.min),
-                        "date_str": hi.get("date_str", ""),
-                        "url": hi.get("url", ""),
-                        "title": hi.get("title", ""),
-                        "route": "direct",
-                        "self_rank": hi.get("self_rank", ""),
-                        "self_umaban": hi.get("self_umaban", ""),
-                        "opp_rank": hi.get("opp_rank", ""),
-                        "opp_umaban": hi.get("opp_umaban", ""),
-                    }
-                    if entry["is_strict"]:
-                        same_cond.append(entry)
-                    else:
-                        other.append(entry)
-                pair_net[u][v].extend(same_cond if same_cond else other)
-                if pair_net[u][v]:
-                    continue
-
-            # 直接がなければ、隠れ馬1頭を介した比較
-            hidden_nodes = [n for n in G.nodes() if n not in current_names]
-            candidates = []
-            for h in hidden_nodes:
-                u_h = advantage_entries_from_edge(G, u, h)  # u > h
-                h_v = advantage_entries_from_edge(G, h, v)  # h > v
-                if not u_h or not h_v:
-                    continue
-                strict_vals = []
-                loose_vals = []
-                for uh in u_h:
-                    for hv in h_v:
-                        p1, d1 = uh.get("place", ""), uh.get("dist", "")
-                        p2, d2 = hv.get("place", ""), hv.get("dist", "")
-                        if p1 == "大井" and p2 == "大井":
-                            if (is_ooi_inner(d1) and is_ooi_outer(d2)) or (is_ooi_outer(d1) and is_ooi_inner(d2)):
-                                continue
-                        if is_one_turn(target_course, cur_dist):
-                            if not is_one_turn(p1, d1) or not is_one_turn(p2, d2):
-                                continue
-                        est = uh["diff"] + hv["diff"]
-                        dt = min(
-                            uh.get("date", datetime.min) if isinstance(uh.get("date"), datetime) else datetime.min,
-                            hv.get("date", datetime.min) if isinstance(hv.get("date"), datetime) else datetime.min,
-                        )
-                        is_strict = p1 == p2 and is_same_track_layout(p1, d1, d2) and p1 == target_course and str(d1) == str(cur_dist)
-                        item = (est, dt, p1, d1, h, uh, hv)
-                        if is_strict:
-                            strict_vals.append(item)
-                        else:
-                            loose_vals.append(item)
-                if strict_vals:
-                    raw = sum(x[0] for x in strict_vals) / len(strict_vals)
-                    best = max(strict_vals, key=lambda x: x[1])
-                    candidates.append({
-                        "diff": raw * 0.7,
-                        "is_strict": True,
-                        "place": best[2],
-                        "dist": best[3],
-                        "water": best[5].get("water"),
-                        "date": best[1],
-                        "date_str": best[5].get("date_str", ""),
-                        "url": best[5].get("url", ""),
-                        "title": best[5].get("title", ""),
-                        "route": f"hidden:{h}",
-                        "via_horse": h,
-                        "via_leg1": dict(best[5]),
-                        "via_leg2": dict(best[6]),
-                    })
-                elif loose_vals:
-                    raw = sum(x[0] for x in loose_vals) / len(loose_vals)
-                    best = max(loose_vals, key=lambda x: x[1])
-                    candidates.append({
-                        "diff": raw * 0.5,
-                        "is_strict": False,
-                        "place": best[2],
-                        "dist": best[3],
-                        "water": best[5].get("water"),
-                        "date": best[1],
-                        "date_str": best[5].get("date_str", ""),
-                        "url": best[5].get("url", ""),
-                        "title": best[5].get("title", ""),
-                        "route": f"hidden:{h}",
-                        "via_horse": h,
-                        "via_leg1": dict(best[5]),
-                        "via_leg2": dict(best[6]),
-                    })
-            if candidates:
-                candidates.sort(key=lambda x: (x["is_strict"], abs(x["diff"]), x["date"]), reverse=True)
-                pair_net[u][v].append(candidates[0])
-
-    return pair_net
-
-
-def inverse_sym(s: str) -> str:
-    return {">>": "<<", ">": "<", "=": "=", "<": ">", "<<": ">>"}.get(s, "=")
-
-
-def compute_matchup_matrix(
-    pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]],
-    runners: List[str],
-    target_course: str,
-    target_distance: str,
-    is_banei: bool,
-) -> Dict[str, Dict[str, str]]:
-    matchup_matrix: Dict[str, Dict[str, str]] = {u: {} for u in runners}
-    now = datetime.now()
-
-    for i, u in enumerate(runners):
-        for j, v in enumerate(runners):
-            if i >= j:
-                continue
-            entries = pair_net.get(u, {}).get(v, [])
-            if not entries:
-                continue
-            best_is_strict = any(e.get("is_strict") for e in entries)
-            target_entries = [e for e in entries if bool(e.get("is_strict")) == best_is_strict]
-            if not target_entries:
-                continue
-            target_entries.sort(key=lambda e: e.get("date") if isinstance(e.get("date"), datetime) else datetime.min, reverse=True)
-            target_entries = target_entries[:3]
-            draw_th, strong_th = thresholds(is_banei, best_is_strict)
-
-            # 厳密条件で勝ち負けが混在する場合は無理に上下を付けない
-            if best_is_strict and len(target_entries) >= 2:
-                has_win = any(e["diff"] >= draw_th for e in target_entries)
-                has_loss = any(e["diff"] <= -draw_th for e in target_entries)
-                if has_win and has_loss:
-                    matchup_matrix[u][v] = "="
-                    matchup_matrix[v][u] = "="
-                    continue
-
-            weighted_sum = 0.0
-            total_weight = 0.0
-            wins = losses = 0
-            for k, e in enumerate(target_entries):
-                base_w = 1.0 if k == 0 else 0.85 if k == 1 else 0.65
-                dt = e.get("date")
-                days = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
-                months = max(0.0, days / 30.0)
-                if e.get("is_strict"):
-                    time_w = 1.0 if months <= 3 else 0.65 if months <= 6 else 0.35
-                else:
-                    time_w = 1.0 if months <= 2 else 0.8 if months <= 3 else 0.55 if months <= 6 else 0.3
-                w = base_w * time_w
-                d = e["diff"]
-                if d >= draw_th:
-                    wins += 1
-                elif d <= -draw_th:
-                    losses += 1
-                weighted_sum += d * w
-                total_weight += w
-            avg = weighted_sum / total_weight if total_weight else 0.0
-
-            if wins == len(target_entries) and wins > 0:
-                sym = ">>" if avg >= strong_th else ">"
-            elif losses == len(target_entries) and losses > 0:
-                sym = "<<" if avg <= -strong_th else "<"
-            elif avg >= draw_th:
-                sym = ">>" if avg >= strong_th else ">"
-            elif avg <= -draw_th:
-                sym = "<<" if avg <= -strong_th else "<"
-            else:
-                sym = "="
-
-            matchup_matrix[u][v] = sym
-            matchup_matrix[v][u] = inverse_sym(sym)
-
-    return matchup_matrix
-
-
-def evaluate_and_rank(
-    pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]],
-    matchup_matrix: Dict[str, Dict[str, str]],
-    umaban_dict: Dict[str, str],
-) -> Tuple[Dict[str, str], List[Tuple[str, int]], List[str]]:
-    """直接対決を最重要視してランク化する。"""
-    runners = list(umaban_dict.keys())
-
-    comparable = set()
-    for u in runners:
-        for v in runners:
-            if u != v and pair_net.get(u, {}).get(v):
-                comparable.add(u)
-                comparable.add(v)
-
-    tiers: Dict[str, Optional[str]] = {u: None for u in runners}
-    pool = set(comparable)
-
-    def pair_weight(u: str, v: str) -> float:
-        entries = pair_net.get(u, {}).get(v, [])
-        if not entries:
-            return 0.0
-        return 10.0 if any(e.get("route") == "direct" for e in entries) else 1.0
-
-    def rel_strength(rel: str) -> float:
-        if rel in (">>", "<<"):
-            return 1.5
-        if rel in (">", "<"):
-            return 1.0
-        return 0.0
-
-    for tier in ("S", "A", "B", "C"):
-        if not pool:
-            break
-        if tier == "C":
-            for h in pool:
-                tiers[h] = "C"
-            break
-
-        stats: Dict[str, Dict[str, float]] = {}
-        for u in pool:
-            direct_loss = total_loss = direct_win = total_win = compared = 0.0
-            for v in pool:
-                if u == v:
-                    continue
-                rel = matchup_matrix.get(u, {}).get(v)
-                w = pair_weight(u, v)
-                if not rel or w <= 0:
-                    continue
-                compared += 1
-                st = rel_strength(rel)
-                if rel in ("<", "<<"):
-                    total_loss += w * st
-                    if w >= 10:
-                        direct_loss += w * st
-                elif rel in (">", ">>"):
-                    total_win += w * st
-                    if w >= 10:
-                        direct_win += w * st
-            stats[u] = {
-                "direct_loss": direct_loss,
-                "total_loss": total_loss,
-                "direct_win": direct_win,
-                "total_win": total_win,
-                "compared": compared,
+// ==========================================
+// 🔔 通知マネージャー（🌟 スマート通知制御）
+// ==========================================
+class AppNotificationManager {
+    static let shared = AppNotificationManager()
+    
+    func updateNotifications(logs: [JibunLog]) {
+        let isEnabled = UserDefaults.standard.object(forKey: "isNotificationEnabled") as? Bool ?? true
+        let hour = UserDefaults.standard.object(forKey: "notificationHour") as? Int ?? 23
+        let minute = UserDefaults.standard.object(forKey: "notificationMinute") as? Int ?? 0
+        
+        let center = UNUserNotificationCenter.current()
+        center.removeAllPendingNotificationRequests()
+        
+        guard isEnabled else { return }
+        
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { return }
+            
+            let content = UNMutableNotificationContent()
+            content.title = "今日もお疲れ様でした☕️"
+            content.body = "1分で終わる『自分ログ』をつけて、今日を振り返りませんか？"
+            content.sound = .default
+            
+            let calendar = Calendar.current
+            let now = Date()
+            let today = calendar.startOfDay(for: now)
+            
+            // 🌟 今日すでにログが存在するかチェック
+            let hasLoggedToday = logs.contains { calendar.isDate($0.date, inSameDayAs: today) }
+            
+            // 向こう14日分の通知をスケジュール（すでに記録済みの日はスキップ）
+            for i in 0..<14 {
+                if i == 0 && hasLoggedToday { continue }
+                
+                guard let targetDate = calendar.date(byAdding: .day, value: i, to: today),
+                      let triggerDate = calendar.date(bySettingHour: hour, minute: minute, second: 0, of: targetDate) else { continue }
+                
+                if triggerDate < now { continue }
+                
+                let components = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: triggerDate)
+                let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+                let request = UNNotificationRequest(identifier: "dailyReminder_\(i)", content: content, trigger: trigger)
+                
+                center.add(request)
             }
+        }
+    }
+}
 
-        min_direct_loss = min(stats[u]["direct_loss"] for u in pool)
-        cands = [u for u in pool if stats[u]["direct_loss"] == min_direct_loss]
-        min_total_loss = min(stats[u]["total_loss"] for u in cands)
-        cands = [u for u in cands if stats[u]["total_loss"] == min_total_loss]
-        max_direct_win = max(stats[u]["direct_win"] for u in cands)
-        cands = [u for u in cands if stats[u]["direct_win"] == max_direct_win]
-        max_total_win = max(stats[u]["total_win"] for u in cands)
-        cands = [u for u in cands if stats[u]["total_win"] == max_total_win]
-        max_compared = max(stats[u]["compared"] for u in cands)
-        cands = [u for u in cands if stats[u]["compared"] == max_compared]
+// ==========================================
+// 📱 アプリの土台
+// ==========================================
+struct ContentView: View {
+    let bgColor = Color(red: 249/255, green: 248/255, blue: 244/255)
+    @AppStorage("themeColorIndex") private var themeColorIndex = 0
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @State private var selectedTab = 2
+    @Query private var logs: [JibunLog]
+    
+    var mainColor: Color { ThemeColor(rawValue: themeColorIndex)?.color ?? ThemeColor.sageGreen.color }
+    
+    var body: some View {
+        if hasCompletedOnboarding {
+            TabView(selection: $selectedTab) {
+                InsightView(bgColor: bgColor, mainColor: mainColor)
+                    .tabItem { Image(systemName: "lightbulb.fill"); Text("トリセツ") }.tag(0)
+                NavigationStack { DiaryView(bgColor: bgColor, mainColor: mainColor) }
+                    .tabItem { Image(systemName: "book.closed.fill"); Text("ダイアリー") }.tag(1)
+                HomeView(bgColor: bgColor, mainColor: mainColor, selectedTab: $selectedTab)
+                    .tabItem { Image(systemName: "house.circle.fill").environment(\.symbolVariants, .fill); Text("ホーム") }.tag(2)
+                NavigationStack { LogView(bgColor: bgColor, mainColor: mainColor) }
+                    .tabItem { Image(systemName: "calendar"); Text("ログ") }.tag(3)
+                NavigationStack { SettingsView(bgColor: bgColor, mainColor: mainColor) }
+                    .tabItem { Image(systemName: "gearshape.fill"); Text("設定") }.tag(4)
+            }
+            .tint(mainColor)
+            .onAppear {
+                AppNotificationManager.shared.updateNotifications(logs: logs)
+            }
+        } else {
+            OnboardingView(mainColor: mainColor)
+        }
+    }
+}
 
-        for h in cands:
-            tiers[h] = tier
-        pool -= set(cands)
+// ==========================================
+// 👋 初回設定画面
+// ==========================================
+struct OnboardingView: View {
+    @AppStorage("nickname") private var nickname = ""
+    @AppStorage("birthday") private var birthday = Date()
+    @AppStorage("postalCode") private var postalCode = ""
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    let mainColor: Color
+    @Query private var logs: [JibunLog]
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("あなたについて教えてください"), footer: Text("郵便番号は天気の自動取得にのみ使用されます。")) {
+                    TextField("ニックネーム（必須）", text: $nickname)
+                    DatePicker("誕生日", selection: $birthday, displayedComponents: .date).environment(\.locale, Locale(identifier: "ja_JP"))
+                    TextField("郵便番号（ハイフンなし7桁）", text: $postalCode).keyboardType(.numberPad)
+                }
+                Button(action: {
+                    hasCompletedOnboarding = true
+                    AppNotificationManager.shared.updateNotifications(logs: logs)
+                }) {
+                    Text("Jibunlogをはじめる").bold().frame(maxWidth: .infinity).padding().foregroundColor(.white).background(nickname.isEmpty ? Color.gray : mainColor).cornerRadius(10)
+                }.disabled(nickname.isEmpty)
+            }
+            .navigationTitle("初期設定")
+        }
+    }
+}
 
-    tier_map: Dict[str, str] = {}
-    ranked: List[Tuple[str, int]] = []
-    unranked: List[str] = []
-    score_by = {"S": 4, "A": 3, "B": 2, "C": 1}
-    for u in runners:
-        t = tiers.get(u)
-        if t is None:
-            unranked.append(u)
-        else:
-            tier_map[u] = t
-            ranked.append((u, score_by.get(t, 0)))
+// ==========================================
+// 📦 データの設計図
+// ==========================================
+@Model
+class JibunLog: Identifiable {
+    var date: Date
+    var score: Double
+    var mainActivity: String
+    var activityLevel: Int
+    var stepCount: String
+    var breakfast: String
+    var lunch: String
+    var dinner: String
+    var foodMeat: String
+    var foodFish: String
+    var foodVeg: String
+    var alcohol: String
+    var caffeine: String
+    var tobacco: String
+    var exercise: String
+    var sleepTime: String
+    var sleepQuality: String
+    var goodThing: String
+    var memo: String
+    var photoData: Data?
+    var weather: String
+    var socialInteraction: String = "-"
+    
+    init(date: Date, score: Double, mainActivity: String, activityLevel: Int, stepCount: String, breakfast: String, lunch: String, dinner: String, foodMeat: String, foodFish: String, foodVeg: String, alcohol: String, caffeine: String, tobacco: String, exercise: String, sleepTime: String, sleepQuality: String, goodThing: String, memo: String, photoData: Data? = nil, weather: String = "-", socialInteraction: String = "-") {
+        self.date = date; self.score = score; self.mainActivity = mainActivity; self.activityLevel = activityLevel; self.stepCount = stepCount; self.breakfast = breakfast; self.lunch = lunch; self.dinner = dinner; self.foodMeat = foodMeat; self.foodFish = foodFish; self.foodVeg = foodVeg; self.alcohol = alcohol; self.caffeine = caffeine; self.tobacco = tobacco; self.exercise = exercise; self.sleepTime = sleepTime; self.sleepQuality = sleepQuality; self.goodThing = goodThing; self.memo = memo; self.photoData = photoData; self.weather = weather; self.socialInteraction = socialInteraction
+    }
+}
 
-    ranked.sort(
-        key=lambda x: (
-            x[1],
-            -int(umaban_dict.get(x[0], "999") if str(umaban_dict.get(x[0], "")).isdigit() else 999),
-        ),
-        reverse=True,
-    )
-    return tier_map, ranked, unranked
+// ==========================================
+// 🏃‍♂️ 歩数を取得する裏方さん
+// ==========================================
+class HealthKitManager: ObservableObject {
+    let healthStore = HKHealthStore()
+    @Published var stepCount: String = "取得中..."
+    
+    func requestAuthorization(for date: Date? = nil) {
+        guard let stepType = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return }
+        healthStore.requestAuthorization(toShare: [], read: [stepType]) { success, _ in
+            if success { self.fetchSteps(for: date ?? Date()) }
+            else { DispatchQueue.main.async { self.stepCount = "許可が必要" } }
+        }
+    }
+    
+    func fetchSteps(for date: Date, completion: ((String) -> Void)? = nil) {
+        guard let stepType = HKQuantityType.quantityType(forIdentifier: .stepCount) else { return }
+        let startOfDay = Calendar.current.startOfDay(for: date)
+        let endOfDay = Calendar.current.date(byAdding: .day, value: 1, to: startOfDay)!
+        let predicate = HKQuery.predicateForSamples(withStart: startOfDay, end: endOfDay, options: .strictStartDate)
+        
+        let query = HKStatisticsQuery(quantityType: stepType, quantitySamplePredicate: predicate, options: .cumulativeSum) { _, result, _ in
+            let steps = Int(result?.sumQuantity()?.doubleValue(for: HKUnit.count()) ?? 0)
+            DispatchQueue.main.async {
+                let stepString = "\(steps)"
+                self.stepCount = stepString
+                completion?(stepString)
+            }
+        }
+        healthStore.execute(query)
+    }
+}
 
+// ==========================================
+// 🏠 ホーム画面
+// ==========================================
+struct HomeView: View {
+    let bgColor: Color; let mainColor: Color; @Binding var selectedTab: Int
+    @Environment(\.modelContext) private var modelContext
+    @Query private var logs: [JibunLog]
+    @StateObject private var healthKitManager = HealthKitManager()
+    @AppStorage("nickname") private var nickname = ""
+    @AppStorage("postalCode") private var postalCode = ""
+    
+    @State private var isFormVisible = false
+    @State private var showToast = false
+    
+    @State private var score: Double = 5.0; @State private var mainActivity: String = "-"
+    @State private var socialInteraction: String = "-"
+    @State private var activityLevel: Double = 3.0; @State private var stepCount: String = ""
+    @State private var breakfast: String = "-"; @State private var lunch: String = "-"; @State private var dinner: String = "-"
+    @State private var foodMeat: String = "-"; @State private var foodFish: String = "-"; @State private var foodVeg: String = "-"
+    @State private var alcohol: String = "-"; @State private var caffeine: String = "-"; @State private var tobacco: String = "-"; @State private var exercise: String = "-"
+    @State private var sleepTime: String = "-"; @State private var sleepQuality: String = "-"
+    @State private var goodThing: String = ""; @State private var memo: String = ""; @State private var weather: String = "-"
+    @State private var photoData: Data? = nil; @State private var selectedPhotoItem: PhotosPickerItem? = nil
 
-# ==========================================
-# 5. HTML出力
-# ==========================================
+    let mainActivityOptions = ["-", "仕事", "遊び", "無"]
+    let levelOptions = ["-", "無", "少", "普", "多"]
+    let mealOptions = ["-", "無", "自炊", "購入", "外食"]
+    let sleepTimeOptions = ["-", "-3h", "4-6h", "6-8h", "8h-"]
+    let qualityOptions = ["-", "悪い", "普通", "良い"]
 
-def diff_symbol_and_color(adv: float, is_banei: bool, is_strict: bool) -> Tuple[str, str]:
-    draw_th, strong_th = thresholds(is_banei, is_strict)
-    if abs(adv) < draw_th:
-        return "＝", "#777"
-    if adv > 0:
-        return ("≫" if adv >= strong_th else "＞"), "#189a55"
-    return ("≪" if adv <= -strong_th else "＜"), "#d83a3a"
+    var targetDate: Date {
+        let now = Date()
+        let hour = Calendar.current.component(.hour, from: now)
+        if hour < 5 { return Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now }
+        return now
+    }
+    
+    var dateTitleText: String {
+        let f = DateFormatter(); f.dateFormat = "M/d"; f.locale = Locale(identifier: "ja_JP")
+        return "今日(\(f.string(from: targetDate)))の記録"
+    }
 
+    var greetingText: String {
+        let hour = Calendar.current.component(.hour, from: Date())
+        switch hour {
+        case 5..<11: return "おはようございます☀️"
+        case 11..<17: return "こんにちは☕️"
+        case 17..<24: return "今日もお疲れ様です🌙"
+        default: return "夜遅くまでお疲れ様です🦉"
+        }
+    }
+    
+    var currentStreak: Int {
+        let sortedLogs = logs.sorted { $0.date > $1.date }
+        guard !sortedLogs.isEmpty else { return 0 }
+        let calendar = Calendar.current; var streak = 0; var expectedDate = calendar.startOfDay(for: targetDate)
+        let firstLogDate = calendar.startOfDay(for: sortedLogs[0].date)
+        if (calendar.dateComponents([.day], from: firstLogDate, to: expectedDate).day ?? 0) > 1 { return 0 }
+        expectedDate = firstLogDate
+        for log in sortedLogs {
+            let logDay = calendar.startOfDay(for: log.date)
+            if logDay == expectedDate { streak += 1; expectedDate = calendar.date(byAdding: .day, value: -1, to: expectedDate)! }
+            else if logDay < expectedDate { break }
+        }
+        return streak
+    }
 
-def _safe_link(url: str, label: str) -> str:
-    label = html.escape(label or "レース")
-    if not url:
-        return label
-    return f"<a href='{html.escape(url)}' target='_blank' rel='noopener noreferrer'>{label}</a>"
+    @ViewBuilder func rowLabel(icon: String, text: String, color: Color = .primary) -> some View {
+        HStack(spacing: 8) { Image(systemName: icon).foregroundColor(color).frame(width: 24); Text(text); Spacer() }.frame(width: 80)
+    }
 
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 25) {
+                    VStack(spacing: 10) {
+                        Text("\(nickname)さん、\n\(greetingText)").font(.title2).bold().multilineTextAlignment(.center).foregroundColor(mainColor).padding(.top, 20)
+                        if currentStreak > 0 {
+                            HStack { Image(systemName: "flame.fill").foregroundColor(.orange); Text("現在 \(currentStreak) 日連続で記録中！").font(.headline).foregroundColor(.secondary) }
+                            .padding(.horizontal, 20).padding(.vertical, 10).background(Color.orange.opacity(0.1)).cornerRadius(20)
+                        } else {
+                            Text("ここから新しい記録を始めましょう！").font(.subheadline).foregroundColor(.secondary)
+                        }
+                    }.padding(.bottom, 10)
+                    
+                    Button(action: { withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) { isFormVisible.toggle() } }) {
+                        HStack { Image(systemName: isFormVisible ? "xmark.circle.fill" : "pencil.circle.fill"); Text(isFormVisible ? "閉じる" : "本日の記録をつける") }
+                        .font(.headline).foregroundColor(.white).frame(maxWidth: .infinity).padding().background(isFormVisible ? Color.gray : mainColor).cornerRadius(15).shadow(color: (isFormVisible ? Color.gray : mainColor).opacity(0.4), radius: 8, x: 0, y: 4)
+                    }.padding(.horizontal, 20)
+                    
+                    if isFormVisible {
+                        VStack(spacing: 30) {
+                            VStack {
+                                HStack { Text(dateTitleText).font(.headline).foregroundColor(.white); Spacer(); Text("\(Int(score)) 点").font(.title2).bold().foregroundColor(.white) }
+                                Slider(value: $score, in: 0...10, step: 1).tint(.white)
+                            }.padding().background(mainColor).cornerRadius(15).shadow(color: mainColor.opacity(0.4), radius: 8, x: 0, y: 4)
+                            
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "figure.walk"); Text("今日の過ごし方").font(.headline) }
+                                Picker("主にしたこと", selection: $mainActivity) { ForEach(mainActivityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented)
+                                if mainActivity == "仕事" || mainActivity == "遊び" { Text("充実度・忙しさ: \(Int(activityLevel))").font(.subheadline); Slider(value: $activityLevel, in: 1...5, step: 1).tint(mainColor) }
+                                Divider()
+                                HStack { rowLabel(icon: "person.2.fill", text: "人との関わり", color: .purple); Spacer(); Picker("", selection: $socialInteraction) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                            }.padding().background(Color.white).cornerRadius(15)
 
-def _race_link_label(e: Dict[str, Any]) -> str:
-    title = e.get("title") or "レース"
-    date = e.get("date_str") or ""
-    place = e.get("place") or ""
-    dist = e.get("dist") or ""
-    return f"{date} {place}{dist} {title}".strip()
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "leaf.fill"); Text("天気と歩数").font(.headline) }
+                                HStack { rowLabel(icon: "cloud.fill", text: "天気", color: .cyan); Spacer(); Picker("", selection: $weather) { Text("-").tag("-"); Image(systemName: "sun.max.fill").tag("☀️"); Image(systemName: "cloud.fill").tag("☁️"); Image(systemName: "cloud.rain.fill").tag("☔️"); Image(systemName: "snowflake").tag("☃️") }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "shoeprints.fill", text: "歩数"); Spacer(); TextField("歩数", text: $healthKitManager.stepCount).keyboardType(.numberPad).textFieldStyle(RoundedBorderTextFieldStyle()).frame(width: 100); Text("歩") }
+                            }.padding().background(Color.white).cornerRadius(15)
+                            
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "fork.knife"); Text("食事").font(.headline) }
+                                HStack { rowLabel(icon: "sun.max.fill", text: "朝", color: .orange); Spacer(); Picker("", selection: $breakfast) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "sun.haze.fill", text: "昼", color: .orange); Spacer(); Picker("", selection: $lunch) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "moon.stars.fill", text: "夜", color: .blue); Spacer(); Picker("", selection: $dinner) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                Divider()
+                                HStack { rowLabel(icon: "frying.pan.fill", text: "肉"); Spacer(); Picker("", selection: $foodMeat) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "fish.fill", text: "魚", color: .blue); Spacer(); Picker("", selection: $foodFish) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "carrot.fill", text: "野菜", color: .orange); Spacer(); Picker("", selection: $foodVeg) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                            }.padding().background(Color.white).cornerRadius(15)
+                            
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "figure.run"); Text("習慣・アクティビティ").font(.headline) }
+                                HStack { rowLabel(icon: "wineglass.fill", text: "酒", color: .purple); Spacer(); Picker("", selection: $alcohol) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "mug.fill", text: "カフェイン", color: .brown); Spacer(); Picker("", selection: $caffeine) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "smoke.fill", text: "タバコ", color: .gray); Spacer(); Picker("", selection: $tobacco) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "dumbbell.fill", text: "運動", color: .green); Spacer(); Picker("", selection: $exercise) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                            }.padding().background(Color.white).cornerRadius(15)
+                            
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "bed.double.fill"); Text("睡眠").font(.headline) }
+                                HStack { rowLabel(icon: "clock.fill", text: "時間"); Spacer(); Picker("", selection: $sleepTime) { ForEach(sleepTimeOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                                HStack { rowLabel(icon: "star.fill", text: "質", color: .yellow); Spacer(); Picker("", selection: $sleepQuality) { ForEach(qualityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }
+                            }.padding().background(Color.white).cornerRadius(15)
+                            
+                            VStack(alignment: .leading, spacing: 15) {
+                                HStack { Image(systemName: "square.and.pencil"); Text("今日の振り返り").font(.headline) }
+                                TextField("今日良かったこと（30文字以内）", text: $goodThing).textFieldStyle(RoundedBorderTextFieldStyle()).onChange(of: goodThing) { _, newValue in if newValue.count > 30 { goodThing = String(newValue.prefix(30)) } }
+                                TextEditor(text: $memo).frame(height: 100).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.3), lineWidth: 1))
+                                PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                                    HStack { Image(systemName: "photo.on.rectangle.angled"); Text(photoData == nil ? "今日の1枚を追加" : "写真を変更する") }.foregroundColor(mainColor).frame(maxWidth: .infinity).padding().background(mainColor.opacity(0.1)).cornerRadius(10)
+                                }
+                                .onChange(of: selectedPhotoItem) { _, newValue in Task { if let data = try? await newValue?.loadTransferable(type: Data.self) { photoData = data } } }
+                                if let photoData, let uiImage = UIImage(data: photoData) { Image(uiImage: uiImage).resizable().scaledToFill().frame(height: 200).frame(maxWidth: .infinity).clipped().cornerRadius(10) }
+                            }.padding().background(Color.white).cornerRadius(15)
+                            
+                            Button(action: {
+                                let saveDate = targetDate
+                                if let existingLog = logs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: saveDate) }) { modelContext.delete(existingLog) }
+                                let newLog = JibunLog(date: saveDate, score: score, mainActivity: mainActivity, activityLevel: Int(activityLevel), stepCount: healthKitManager.stepCount, breakfast: breakfast, lunch: lunch, dinner: dinner, foodMeat: foodMeat, foodFish: foodFish, foodVeg: foodVeg, alcohol: alcohol, caffeine: caffeine, tobacco: tobacco, exercise: exercise, sleepTime: sleepTime, sleepQuality: sleepQuality, goodThing: goodThing, memo: memo, photoData: photoData, weather: weather, socialInteraction: socialInteraction)
+                                modelContext.insert(newLog)
+                                
+                                AppNotificationManager.shared.updateNotifications(logs: logs)
+                                
+                                withAnimation(.spring()) { showToast = true; isFormVisible = false }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                                    withAnimation { showToast = false }
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { selectedTab = 0 }
+                                }
+                            }) { Text("記録を保存する").font(.headline).foregroundColor(.white).frame(maxWidth: .infinity).padding(.vertical, 16).background(mainColor).cornerRadius(15) }.padding(.bottom, 60)
+                        }.padding(.horizontal, 20).transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else { Spacer().frame(height: 100) }
+                }
+            }
+            if showToast { VStack { Spacer(); Text("記録完了！今日も１日お疲れさまでした！").font(.subheadline).bold().foregroundColor(.white).padding(.horizontal, 24).padding(.vertical, 14).background(mainColor.opacity(0.95)).cornerRadius(25).shadow(radius: 10).padding(.bottom, 20) }.transition(.move(edge: .bottom).combined(with: .opacity)).zIndex(1) }
+        }
+        .onAppear { healthKitManager.requestAuthorization(for: targetDate); fetchWeather() }
+    }
+    private func fetchWeather() {}
+}
 
+// ==========================================
+// 💡 トリセツ画面（🌟 美しいUI＆チャート切り替え）
+// ==========================================
+struct InsightItem: Identifiable { let id = UUID(); let title: String; let icon: String; let description: String; let color: Color }
 
-def build_html_output(
-    tier_map: Dict[str, str],
-    ranked: List[Tuple[str, int]],
-    unranked: List[str],
-    umaban_dict: Dict[str, str],
-    pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]],
-    matchup_matrix: Dict[str, Dict[str, str]],
-    target_course: str,
-    target_distance: str,
-    target_water: Optional[float],
-    water_filter_bucket: Optional[str],
-    is_banei: bool,
-) -> str:
-    runners = list(umaban_dict.keys())
-    tier_colors = {"S": "#e74c3c", "A": "#e67e22", "B": "#f1c40f", "C": "#3498db"}
-    tier_names = {"S": "最上位", "A": "上位", "B": "中位", "C": "下位"}
-    water_txt = f" / 水分量:{target_water:.1f}%" if target_water is not None else ""
-    filter_txt = f" / 水分量フィルタ:{water_bucket_label(water_filter_bucket)}" if is_banei else ""
-    parts = ["<div style='font-family:-apple-system,BlinkMacSystemFont,Meiryo,sans-serif;font-size:14px;color:#333;'>"]
-    parts.append(
-        f"<div style='padding:10px 12px;background:#f7f9fb;border:1px solid #e1e7ef;border-radius:8px;margin-bottom:14px;'>"
-        f"対象条件：<b>{html.escape(target_course)}{html.escape(str(target_distance))}</b>{html.escape(water_txt)}{html.escape(filter_txt)} "
-        f"/ 直接対決を最優先 / ＞は本馬優勢、＜は劣勢</div>"
-    )
+struct ImpactFactor: Identifiable {
+    let id = UUID()
+    let title: String
+    let value: String
+    let impact: Double
+    let icon: String
+    let color: Color
+}
 
-    def render_entry(u: str, v: str, e: Dict[str, Any]) -> str:
-        sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")))
-        badge = "同条件" if e.get("is_strict") else f"{e.get('place','?')}{e.get('dist','?')}"
-        water = e.get("water")
-        wtxt = f"水分:{water:.1f}%" if isinstance(water, (int, float)) else ""
-        v_uma = umaban_dict.get(v, "?")
-        route = e.get("route", "direct")
-        if route == "direct":
-            race_link = _safe_link(e.get("url", ""), _race_link_label(e))
-            self_rank = e.get("self_rank") or "?"
-            self_umaban = e.get("self_umaban") or "?"
-            opp_rank = e.get("opp_rank") or "?"
-            opp_umaban = e.get("opp_umaban") or "?"
-            route_html = (
-                f"<span style='color:#0b65c2;font-weight:700;'>直接</span> "
-                f"<span style='color:#777;'>当時: 本馬 {html.escape(str(self_rank))}着/{html.escape(str(self_umaban))}番 "
-                f"vs 相手 {html.escape(str(opp_rank))}着/{html.escape(str(opp_umaban))}番</span> "
-                f"{race_link}"
-            )
-        else:
-            via = e.get("via_horse") or route.replace("hidden:", "")
-            leg1 = e.get("via_leg1", {}) or {}
-            leg2 = e.get("via_leg2", {}) or {}
-            route_html = (
-                f"<span style='color:#8e44ad;font-weight:700;'>経由：{html.escape(str(via))}</span> "
-                f"<span style='color:#777;'>本馬↔経由馬:</span> {_safe_link(leg1.get('url',''), _race_link_label(leg1))} "
-                f"<span style='color:#aaa;'>/</span> "
-                f"<span style='color:#777;'>経由馬↔相手:</span> {_safe_link(leg2.get('url',''), _race_link_label(leg2))}"
-            )
-        return (
-            f"<div style='margin-left:10px;font-size:.86em;line-height:1.7;margin-bottom:5px;'>"
-            f"<span style='display:inline-block;background:#eef3f8;border-radius:999px;padding:1px 7px;margin-right:4px;'>{html.escape(badge)}</span>"
-            f"<span style='color:#777;'>{html.escape(wtxt)}</span> "
-            f"本馬 <span style='color:{c};font-weight:800;'>{sym}</span> [{html.escape(v_uma)}]{html.escape(v)} "
-            f"<span style='color:{c};'>({e.get('diff',0.0):+.1f}秒換算)</span><br>"
-            f"<span style='margin-left:14px;'>{route_html}</span>"
-            f"</div>"
-        )
+struct InsightView: View {
+    let bgColor: Color; let mainColor: Color
+    @Query(sort: \JibunLog.date, order: .reverse) private var logs: [JibunLog]
+    
+    // 🌟 平均スコアの計算
+    var averageScore: Double { if logs.isEmpty { return 0 }; return logs.reduce(0) { $0 + $1.score } / Double(logs.count) }
+    
+    var weekAverageScore: Double {
+        guard let oneWeekAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) else { return 0 }
+        let filtered = logs.filter { $0.date >= oneWeekAgo }
+        if filtered.isEmpty { return 0 }
+        return filtered.reduce(0) { $0 + $1.score } / Double(filtered.count)
+    }
+    
+    var monthAverageScore: Double {
+        guard let oneMonthAgo = Calendar.current.date(byAdding: .month, value: -1, to: Date()) else { return 0 }
+        let filtered = logs.filter { $0.date >= oneMonthAgo }
+        if filtered.isEmpty { return 0 }
+        return filtered.reduce(0) { $0 + $1.score } / Double(filtered.count)
+    }
 
-    def render_horse(u: str) -> str:
-        uma = umaban_dict.get(u, "?")
-        tier = tier_map.get(u, "C")
-        color = tier_colors.get(tier, "#95a5a6")
-        hp = [
-            f"<div style='margin:0 0 16px 0;border-left:5px solid {color};padding:10px 12px;background:#fff;border-radius:6px;box-shadow:0 1px 3px rgba(0,0,0,.06);'>",
-            f"<div style='font-size:1.1em;font-weight:800;'>[{html.escape(uma)}] {html.escape(u)}</div>",
-        ]
-        wins = draws = losses = direct_wins = direct_losses = 0
-        for v in runners:
-            if u == v:
-                continue
-            rel = matchup_matrix.get(u, {}).get(v)
-            entries = pair_net.get(u, {}).get(v, [])
-            is_direct = any(e.get("route") == "direct" for e in entries)
-            if rel in (">", ">>"):
-                wins += 1
-                if is_direct:
-                    direct_wins += 1
-            elif rel in ("<", "<<"):
-                losses += 1
-                if is_direct:
-                    direct_losses += 1
-            elif rel == "=":
-                draws += 1
-        if wins + draws + losses:
-            hp.append(
-                f"<div style='font-size:.86em;margin:4px 0 8px 0;'>"
-                f"総合対戦：<span style='color:#189a55;font-weight:700;'>{wins}優勢</span> / "
-                f"<span style='color:#777;'>{draws}互角</span> / "
-                f"<span style='color:#d83a3a;font-weight:700;'>{losses}劣勢</span> "
-                f"<span style='color:#555;'>（直接: {direct_wins}優勢 / {direct_losses}劣勢）</span></div>"
-            )
-        all_lines = []
-        for v in runners:
-            if u == v:
-                continue
-            entries = pair_net.get(u, {}).get(v, [])
-            if not entries:
-                continue
-            entries = sorted(
-                entries,
-                key=lambda e: (e.get("route") == "direct", bool(e.get("is_strict")), e.get("date") if isinstance(e.get("date"), datetime) else datetime.min),
-                reverse=True,
-            )[:3]
-            for e in entries:
-                all_lines.append((1 if e.get("route") == "direct" else 0, e.get("date") if isinstance(e.get("date"), datetime) else datetime.min, render_entry(u, v, e)))
-        all_lines.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        lines = [x[2] for x in all_lines]
-        hp.append("".join(lines[:16]) if lines else "<div style='margin-left:10px;font-size:.86em;color:#999;'>比較可能な直接・間接データなし</div>")
-        hp.append("</div>")
-        return "\n".join(hp)
+    var recentLogs: [JibunLog] { Array(logs.prefix(14)) }
+    
+    var happyKeywords: [String] {
+        let texts = logs.filter { $0.score >= averageScore }.map { $0.goodThing }.joined(separator: " ")
+        guard !texts.isEmpty else { return [] }
+        let tokenizer = NLTokenizer(unit: .word); tokenizer.string = texts; var wordCounts: [String: Int] = [:]
+        tokenizer.enumerateTokens(in: texts.startIndex..<texts.endIndex) { range, _ in
+            let word = String(texts[range]); if word.count > 1 { wordCounts[word, default: 0] += 1 }; return true
+        }
+        return wordCounts.sorted { $0.value > $1.value }.prefix(4).map { $0.key }
+    }
+    
+    var impactFactors: [ImpactFactor] {
+        guard logs.count >= 3 else { return [] }
+        let overallAvg = averageScore
+        var factors: [String: (total: Double, count: Int, title: String, value: String, icon: String, color: Color)] = [:]
+        
+        func add(_ val: String, title: String, icon: String, color: Color, score: Double) {
+            if val != "-" && val != "無" && val != "" {
+                let key = "\(title):\(val)"
+                if factors[key] == nil { factors[key] = (0, 0, title, val, icon, color) }
+                factors[key]!.total += score
+                factors[key]!.count += 1
+            }
+        }
+        
+        for log in logs {
+            add(log.sleepQuality, title: "睡眠の質", icon: "star.fill", color: .yellow, score: log.score)
+            add(log.sleepTime, title: "睡眠時間", icon: "clock.fill", color: .blue, score: log.score)
+            add(log.exercise, title: "運動", icon: "figure.run", color: .green, score: log.score)
+            add(log.alcohol, title: "酒", icon: "wineglass.fill", color: .purple, score: log.score)
+            add(log.breakfast, title: "朝食", icon: "sun.max.fill", color: .orange, score: log.score)
+            add(log.foodVeg, title: "野菜", icon: "carrot.fill", color: .green, score: log.score)
+            add(log.socialInteraction, title: "人との関わり", icon: "person.2.fill", color: .purple, score: log.score)
+            add(log.mainActivity, title: "行動", icon: "figure.walk", color: .blue, score: log.score)
+        }
+        
+        var result: [ImpactFactor] = []
+        for (_, data) in factors {
+            if data.count >= 2 {
+                let avg = data.total / Double(data.count)
+                let impact = avg - overallAvg
+                if abs(impact) >= 0.3 { result.append(ImpactFactor(title: data.title, value: data.value, impact: impact, icon: data.icon, color: data.color)) }
+            }
+        }
+        
+        let sorted = result.sorted { $0.impact > $1.impact }
+        let top = Array(sorted.prefix(3))
+        let bottom = Array(sorted.suffix(3).filter { $0.impact < 0 })
+        var final = top
+        for b in bottom { if !final.contains(where: { $0.title == b.title && $0.value == b.value }) { final.append(b) } }
+        return final.sorted { $0.impact > $1.impact }
+    }
+    
+    var dynamicInsights: [InsightItem] {
+        if logs.count < 3 { return [] }
+        var insights: [InsightItem] = []
+        let sortedLogs = logs.sorted { $0.score > $1.score }
+        let halfIndex = max(1, sortedLogs.count / 2)
+        let topLogs = Array(sortedLogs.prefix(halfIndex))
+        let bottomLogs = Array(sortedLogs.suffix(sortedLogs.count - halfIndex))
+        
+        func analyze(title: String, icon: String, color: Color, description: String, condition: (JibunLog) -> Bool) {
+            let topRatio = Double(topLogs.filter(condition).count) / Double(max(1, topLogs.count))
+            let bottomRatio = bottomLogs.isEmpty ? 0 : Double(bottomLogs.filter(condition).count) / Double(max(1, bottomLogs.count))
+            if topRatio >= 0.5 && topRatio > bottomRatio { insights.append(InsightItem(title: title, icon: icon, description: description, color: color)) }
+        }
+        
+        analyze(title: "良質な睡眠の恩恵", icon: "bed.double.fill", color: .blue, description: "点数に良い影響をもたらす最強の回復魔法です。", condition: { ($0.sleepQuality == "良い" || $0.sleepTime == "8h-" || $0.sleepTime == "6-8h") && $0.sleepQuality != "-" })
+        analyze(title: "朝食のパワー", icon: "sun.max.fill", color: .orange, description: "1日のパフォーマンスや充実度が底上げされています。", condition: { $0.breakfast != "-" && $0.breakfast != "無" })
+        analyze(title: "クリアな心身", icon: "drop.fill", color: .cyan, description: "お酒を控えた日ほど、コンディションが安定しています。", condition: { $0.alcohol == "無" })
+        insights.append(InsightItem(title: "自分と向き合う才能", icon: "sparkles", description: "調子が良い日も悪い日も記録を残せていること自体が素晴らしい才能です！", color: .orange))
+        
+        return Array(insights.prefix(4))
+    }
 
-    for tier in ("S", "A", "B", "C"):
-        horses = [u for u, _ in ranked if tier_map.get(u) == tier]
-        if not horses:
-            continue
-        parts.append(
-            f"<h3 style='background:{tier_colors[tier]};color:#fff;padding:9px 12px;border-radius:6px;margin:18px 0 10px;'>"
-            f"🏆 {tier}ランク：{tier_names[tier]}</h3>"
-        )
-        for u in horses:
-            parts.append(render_horse(u))
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 25) {
+                    Text("わたしのとりあつかい説明書").font(.title2).bold().padding(.horizontal, 20).padding(.bottom, -10)
+                    
+                    if logs.count < 3 {
+                        Text("あと \(3 - logs.count) 日分記録すると、AIがあなたの傾向を徹底分析します。").foregroundColor(.gray).padding(.horizontal, 20)
+                    } else {
+                        // ① 🌟 概要カード（横並びで綺麗に）
+                        VStack(spacing: 15) {
+                            HStack {
+                                VStack { Text("記録日数").font(.caption).foregroundColor(.gray); Text("\(logs.count) 日").font(.title3).bold().foregroundColor(mainColor) }.frame(maxWidth: .infinity)
+                                Divider()
+                                VStack { Text("通算平均").font(.caption).foregroundColor(.gray); Text(String(format: "%.1f 点", averageScore)).font(.title3).bold().foregroundColor(.orange) }.frame(maxWidth: .infinity)
+                            }
+                            Divider()
+                            HStack {
+                                VStack { Text("直近1ヶ月").font(.caption).foregroundColor(.gray); Text(String(format: "%.1f 点", monthAverageScore)).font(.headline).bold().foregroundColor(.orange) }.frame(maxWidth: .infinity)
+                                Divider()
+                                VStack { Text("直近1週間").font(.caption).foregroundColor(.gray); Text(String(format: "%.1f 点", weekAverageScore)).font(.headline).bold().foregroundColor(.orange) }.frame(maxWidth: .infinity)
+                            }
+                        }
+                        .padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+                        .padding(.horizontal, 20)
+                        
+                        // ② 🌟 チャート（スワイプ切り替え）
+                        TabView {
+                            // タブA：最近のスコア推移
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack { Image(systemName: "chart.xyaxis.line").foregroundColor(mainColor); Text("最近のスコア推移").font(.headline) }
+                                Text("直近14日間の気分の波を表しています。").font(.caption).foregroundColor(.gray)
+                                Chart {
+                                    ForEach(recentLogs.sorted(by: { $0.date < $1.date })) { log in
+                                        LineMark(x: .value("Date", log.date, unit: .day), y: .value("Score", log.score)).symbol(Circle()).foregroundStyle(mainColor)
+                                        AreaMark(x: .value("Date", log.date, unit: .day), y: .value("Score", log.score)).foregroundStyle(LinearGradient(gradient: Gradient(colors: [mainColor.opacity(0.3), Color.clear]), startPoint: .top, endPoint: .bottom))
+                                    }
+                                }.chartYScale(domain: 0...10).frame(height: 180)
+                                Spacer(minLength: 0)
+                            }
+                            .padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+                            .padding(.horizontal, 20).padding(.bottom, 45) // インジケーターのための余白
+                            
+                            // タブB：スコア影響度
+                            if !impactFactors.isEmpty {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack { Image(systemName: "chart.bar.fill").foregroundColor(mainColor); Text("スコアへの影響要素").font(.headline) }
+                                    Text("行動が全体平均スコアにどう影響したかを示しています。").font(.caption).foregroundColor(.gray)
+                                    Chart {
+                                        ForEach(impactFactors) { factor in
+                                            BarMark(x: .value("Impact", factor.impact), y: .value("Factor", "\(factor.title): \(factor.value)"))
+                                                .foregroundStyle(factor.impact > 0 ? Color.green.opacity(0.8) : Color.red.opacity(0.8))
+                                                .annotation(position: factor.impact > 0 ? .trailing : .leading) {
+                                                    Text(String(format: "%+.1f", factor.impact)).font(.caption2).bold().foregroundColor(factor.impact > 0 ? .green : .red)
+                                                }
+                                        }
+                                    }.chartXAxis { AxisMarks(values: .automatic) { value in AxisGridLine(); AxisValueLabel() } }.frame(height: 180)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+                                .padding(.horizontal, 20).padding(.bottom, 45)
+                            }
+                        }
+                        .tabViewStyle(PageTabViewStyle(indexDisplayMode: .always))
+                        .frame(height: 350)
+                        
+                        // ③ ハッピーキーワード
+                        if !happyKeywords.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack { Image(systemName: "quote.bubble.fill").foregroundColor(.orange); Text("ハッピー・キーワード").font(.headline) }
+                                Text("調子が良い時によく登場する言葉です。").font(.caption).foregroundColor(.gray)
+                                HStack { ForEach(happyKeywords, id: \.self) { word in Text(word).font(.subheadline).bold().padding(.horizontal, 12).padding(.vertical, 6).background(Color.orange.opacity(0.2)).foregroundColor(.orange).cornerRadius(15) } }
+                            }.padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+                            .padding(.horizontal, 20)
+                        }
+                        
+                        // ④ AIからのアドバイス
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("💡 AIからのアドバイス").font(.headline).padding(.top, 10).padding(.bottom, 5)
+                            ForEach(dynamicInsights) { insight in
+                                AnalysisCard(title: insight.title, icon: insight.icon, description: insight.description, color: insight.color)
+                            }
+                        }.padding(.horizontal, 20)
+                    }
+                }
+                .padding(.vertical, 20)
+            }
+        }
+        .onAppear {
+            // スクロールインジケーターの色をテーマカラーに合わせる
+            UIPageControl.appearance().currentPageIndicatorTintColor = UIColor(mainColor)
+            UIPageControl.appearance().pageIndicatorTintColor = UIColor(mainColor).withAlphaComponent(0.2)
+        }
+    }
+}
 
-    if unranked:
-        parts.append("<h3 style='background:#95a5a6;color:#fff;padding:9px 12px;border-radius:6px;margin:18px 0 10px;'>❗ 測定不能：別路線・比較データ不足</h3>")
-        for u in unranked:
-            parts.append(
-                f"<div style='margin-bottom:10px;border-left:5px solid #95a5a6;padding:10px 12px;background:#fff;border-radius:6px;'>"
-                f"<b>[{html.escape(umaban_dict.get(u,'?'))}] {html.escape(u)}</b>"
-                f"<div style='margin-left:10px;font-size:.84em;color:#999;'>過去5走内で、他出走馬または隠れ馬経由の比較線が作れませんでした。</div></div>"
-            )
-    parts.append("</div>")
-    return "\n".join(parts)
+struct AnalysisCard: View {
+    let title: String; let icon: String; let description: String; let color: Color
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack { Image(systemName: icon).foregroundColor(color); Text(title).font(.headline) }
+            Text(description).font(.subheadline).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading).padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+    }
+}
 
+// ==========================================
+// 📅 ログ画面
+// ==========================================
+struct LogView: View {
+    let bgColor: Color; let mainColor: Color
+    @Query private var logs: [JibunLog]; @State private var selectedDate = Date()
+    
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 20) {
+                    CustomCalendarView(selectedDate: $selectedDate, logs: logs, mainColor: mainColor)
+                        .padding().background(Color.white).cornerRadius(15).padding(.horizontal).padding(.top, 20)
+                    
+                    if let log = logs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) {
+                        NavigationLink(destination: LogDetailView(log: log, bgColor: bgColor, mainColor: mainColor)) {
+                            HStack {
+                                VStack(alignment: .leading) {
+                                    Text("この日の記録を見る").font(.caption).foregroundColor(.gray)
+                                    Text("\(Int(log.score))点").font(.title).bold().foregroundColor(mainColor)
+                                }
+                                Spacer()
+                                Text(log.weather).font(.title2)
+                                Text(log.mainActivity).font(.headline).foregroundColor(.primary)
+                                Image(systemName: "chevron.right").foregroundColor(.gray)
+                            }.padding().background(Color.white).cornerRadius(15).padding(.horizontal).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+                        }
+                    } else {
+                        VStack(spacing: 15) {
+                            Text("この日の記録はありません").foregroundColor(.gray)
+                            NavigationLink(destination: AddPastLogView(selectedDate: selectedDate, bgColor: bgColor, mainColor: mainColor)) {
+                                Text("記録を追加する").font(.headline).foregroundColor(.white).padding(.vertical, 12).padding(.horizontal, 30).background(mainColor).cornerRadius(25)
+                            }
+                        }.padding()
+                    }
+                    Spacer().frame(height: 40)
+                }
+            }
+        }
+        .navigationTitle("記録ログ")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
 
-def build_group_direct_html(past_races: List[RaceInfo], umaban_dict: Dict[str, str], is_banei: bool) -> str:
-    """同じ過去レースに現在出走馬が3頭以上出ている直接対決を一覧化。"""
-    current_names = set(umaban_dict.keys())
-    races = []
-    for race in past_races:
-        members = [h for h in race.horses.keys() if h in current_names]
-        if len(members) < 3:
-            continue
-        def rank_key(h: str):
-            r = race.ranks.get(h, "999")
-            return int(r) if str(r).isdigit() else 999
-        members.sort(key=rank_key)
-        races.append((parse_date_any(race.race_date), race, members))
-    races.sort(key=lambda x: x[0], reverse=True)
+// ==========================================
+// 📖 ダイアリー画面
+// ==========================================
+enum SortType { case dateDesc, dateAsc, scoreDesc, scoreAsc }
 
-    if not races:
-        return "<div style='padding:12px;background:#fff;border-radius:8px;border:1px solid #e5e7eb;color:#777;'>同じ過去レースに今回出走馬が3頭以上いた直接対決は見つかりませんでした。</div>"
+struct DiaryFilter {
+    var sortType: SortType = .dateDesc
+    var searchText = ""; var minScore: Double = 0.0
+    var weather = "すべて"; var activity = "すべて"; var social = "すべて"
+    var breakfast = "すべて"; var lunch = "すべて"; var dinner = "すべて"
+    var meat = "すべて"; var fish = "すべて"; var veg = "すべて"
+    var alcohol = "すべて"; var caffeine = "すべて"; var tobacco = "すべて"; var exercise = "すべて"
+    var sleepTime = "すべて"; var sleepQuality = "すべて"
+}
 
-    out = ["<div style='font-family:-apple-system,BlinkMacSystemFont,Meiryo,sans-serif;font-size:14px;color:#333;'>"]
-    out.append("<p style='color:#555;'>同じ過去レースに今回出走馬が3頭以上出ていたケースです。直接対決を最重要材料として確認できます。</p>")
-    for _, race, members in races:
-        water = f" / 水分:{race.water:.1f}%" if isinstance(race.water, (int, float)) else ""
-        title_link = _safe_link(race.url, f"{race.race_date} {race.title}")
-        out.append(
-            f"<div style='margin:0 0 16px;background:#fff;border:1px solid #e1e7ef;border-radius:8px;overflow:hidden;'>"
-            f"<div style='background:#f7f9fb;padding:10px 12px;font-weight:800;'>🔗 {title_link} "
-            f"<span style='font-weight:400;color:#666;'>({html.escape(race.course)}{html.escape(str(race.distance))}{html.escape(water)})</span></div>"
-        )
-        out.append("<table style='width:100%;border-collapse:collapse;font-size:13px;'>")
-        out.append("<thead><tr style='background:#fbfbfb;'><th>当時着順</th><th>当時馬番</th><th>今回馬番</th><th>馬名</th><th>タイム</th><th>メモ</th></tr></thead><tbody>")
-        first_time = min([race.horses[h] for h in members if race.horses.get(h) is not None], default=None)
-        for h in members:
-            sec = race.horses.get(h)
-            diff = (sec - first_time) if first_time is not None and sec is not None else 0.0
-            rank = race.ranks.get(h, "?")
-            past_umaban = race.horse_numbers.get(h, "?")
-            cur_umaban = umaban_dict.get(h, "?")
-            time_txt = f"{int(sec//60)}:{sec%60:04.1f}" if isinstance(sec, (int, float)) and sec >= 60 else (f"{sec:.1f}" if isinstance(sec, (int, float)) else "")
-            mark = "同レース内最先着" if abs(diff) < 0.01 else f"最先着から+{diff:.1f}秒"
-            out.append(
-                f"<tr><td style='text-align:center;font-weight:800;'>{html.escape(str(rank))}</td>"
-                f"<td style='text-align:center;'>{html.escape(str(past_umaban))}</td>"
-                f"<td style='text-align:center;'>{html.escape(str(cur_umaban))}</td>"
-                f"<td><b>{html.escape(h)}</b></td>"
-                f"<td style='text-align:center;'>{html.escape(time_txt)}</td>"
-                f"<td style='color:#666;'>{html.escape(mark)}</td></tr>"
-            )
-        out.append("</tbody></table></div>")
-    out.append("<style>td,th{border:1px solid #e5e7eb;padding:7px 8px;} th{font-weight:700;}</style></div>")
-    return "\n".join(out)
+struct DiaryView: View {
+    let bgColor: Color; let mainColor: Color
+    @Query private var logs: [JibunLog]
+    @State private var showingFilter = false
+    @State private var filter = DiaryFilter()
+    
+    var filteredAndSortedLogs: [JibunLog] {
+        var result = logs
+        if !filter.searchText.isEmpty { let text = filter.searchText.lowercased(); result = result.filter { $0.memo.lowercased().contains(text) || $0.goodThing.lowercased().contains(text) || $0.mainActivity.lowercased().contains(text) || $0.weather.contains(text) } }
+        if filter.minScore > 0 { result = result.filter { $0.score >= filter.minScore } }
+        if filter.weather != "すべて" { result = result.filter { $0.weather == filter.weather } }
+        if filter.activity != "すべて" { result = result.filter { $0.mainActivity == filter.activity } }
+        if filter.social != "すべて" { result = result.filter { $0.socialInteraction == filter.social } }
+        if filter.breakfast != "すべて" { result = result.filter { $0.breakfast == filter.breakfast } }
+        if filter.lunch != "すべて" { result = result.filter { $0.lunch == filter.lunch } }
+        if filter.dinner != "すべて" { result = result.filter { $0.dinner == filter.dinner } }
+        if filter.meat != "すべて" { result = result.filter { $0.foodMeat == filter.meat } }
+        if filter.fish != "すべて" { result = result.filter { $0.foodFish == filter.fish } }
+        if filter.veg != "すべて" { result = result.filter { $0.foodVeg == filter.veg } }
+        if filter.alcohol != "すべて" { result = result.filter { $0.alcohol == filter.alcohol } }
+        if filter.caffeine != "すべて" { result = result.filter { $0.caffeine == filter.caffeine } }
+        if filter.tobacco != "すべて" { result = result.filter { $0.tobacco == filter.tobacco } }
+        if filter.exercise != "すべて" { result = result.filter { $0.exercise == filter.exercise } }
+        if filter.sleepTime != "すべて" { result = result.filter { $0.sleepTime == filter.sleepTime } }
+        if filter.sleepQuality != "すべて" { result = result.filter { $0.sleepQuality == filter.sleepQuality } }
+        
+        switch filter.sortType { case .dateDesc: result.sort { $0.date > $1.date }; case .dateAsc: result.sort { $0.date < $1.date }; case .scoreDesc: result.sort { $0.score > $1.score }; case .scoreAsc: result.sort { $0.score < $1.score } }
+        return result
+    }
 
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            if logs.isEmpty {
+                VStack { Image(systemName: "book.closed").font(.system(size: 50)).foregroundColor(.gray).padding(); Text("まだ日記がありません").foregroundColor(.gray); Text("ホームやログから記録をつけると、\nここにAIが書いたような日記が生成されます。").font(.caption).foregroundColor(.gray).multilineTextAlignment(.center).padding(.top, 5) }
+            } else {
+                ScrollView {
+                    VStack(spacing: 20) {
+                        if filteredAndSortedLogs.isEmpty { VStack(spacing: 15) { Image(systemName: "magnifyingglass").font(.system(size: 40)).foregroundColor(.gray); Text("条件に一致する記録がありません").foregroundColor(.gray) }.padding(.top, 60) }
+                        else { ForEach(filteredAndSortedLogs) { log in DiaryEntryCard(log: log, mainColor: mainColor) } }
+                    }.padding(20)
+                }
+            }
+        }
+        .navigationTitle("ダイアリー")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button(action: { showingFilter = true }) { Image(systemName: "magnifyingglass").font(.system(size: 18, weight: .bold)).foregroundColor(mainColor) } } }
+        .sheet(isPresented: $showingFilter) { FilterSortSheet(filter: $filter, mainColor: mainColor).presentationDetents([.large]) }
+    }
+}
 
-def build_matrix_html(matchup_matrix: Dict[str, Dict[str, str]], umaban_dict: Dict[str, str]) -> str:
-    runners = list(umaban_dict.keys())
-    ths = "".join(f"<th>[{html.escape(umaban_dict.get(h,'?'))}]<br>{html.escape(h)}</th>" for h in runners)
-    rows = []
-    for u in runners:
-        tds = [f"<th>[{html.escape(umaban_dict.get(u,'?'))}]<br>{html.escape(u)}</th>"]
-        for v in runners:
-            if u == v:
-                tds.append("<td style='background:#f0f0f0;'>-</td>")
-            else:
-                rel = matchup_matrix.get(u, {}).get(v, "")
-                color = "#189a55" if rel in (">", ">>") else "#d83a3a" if rel in ("<", "<<") else "#777"
-                tds.append(f"<td style='text-align:center;font-weight:800;color:{color};'>{html.escape(rel or ' ')}</td>")
-        rows.append("<tr>" + "".join(tds) + "</tr>")
-    return f"""
-    <div style='overflow:auto;'>
-    <table style='border-collapse:collapse;font-size:12px;background:#fff;'>
-      <thead><tr><th></th>{ths}</tr></thead>
-      <tbody>{''.join(rows)}</tbody>
-    </table>
-    </div>
-    <style>
-      table th, table td {{ border:1px solid #ddd; padding:6px; min-width:58px; }}
-      table th {{ background:#f8fafc; position:sticky; left:0; z-index:1; }}
-      table thead th {{ position:sticky; top:0; z-index:2; }}
-    </style>
-    """
+// 🌟 ダイアリーテキスト生成の進化版
+struct DiaryEntryCard: View {
+    var log: JibunLog; var mainColor: Color
+    var dateTitle: String { let f = DateFormatter(); f.dateFormat = "yyyy年M月d日(E)"; f.locale = Locale(identifier: "ja_JP"); return f.string(from: log.date) }
+    
+    var generatedText: String {
+        var text = ""
+        
+        // 絵文字と食事の日本語変換ヘルパー
+        func wStr(_ e: String) -> String { switch e { case "☀️": return "晴れ"; case "☁️": return "曇り"; case "☔️": return "雨"; case "☃️": return "雪"; default: return e } }
+        func mStr(_ v: String) -> String { switch v { case "自炊": return "自炊"; case "購入": return "購入したもの"; case "外食": return "外食"; default: return v } }
+        
+        // 1. 天気 -> したこと -> 歩数
+        let activityStr = (log.mainActivity != "-" && log.mainActivity != "無") ? "主に「\(log.mainActivity)」をして過ごし" : "特に大きなイベントもなく過ごし"
+        let stepStr = (log.stepCount != "" && log.stepCount != "0" && log.stepCount != "取得中...") ? "、歩数は\(log.stepCount)歩だった。\n" : "た。\n"
+        
+        if log.weather == "-" {
+            text += "今日は\(activityStr)\(stepStr)"
+        } else {
+            text += "今日は\(wStr(log.weather))だった。\(activityStr)\(stepStr)"
+        }
+        
+        // 2. 人との関わり
+        switch log.socialInteraction {
+        case "多": text += "人との関わりも多かった。\n"
+        case "普": text += "人との関わりもほどほどにあった。\n"
+        case "少": text += "人との関わりは少なめだった。\n"
+        case "無": text += "誰とも関わらず、一人で静かに過ごした。\n"
+        default: break
+        }
+        
+        // 3. 食事
+        var meals = [String]()
+        if log.breakfast != "-" && log.breakfast != "無" { meals.append("朝は\(mStr(log.breakfast))") }
+        if log.lunch != "-" && log.lunch != "無" { meals.append("昼は\(mStr(log.lunch))") }
+        if log.dinner != "-" && log.dinner != "無" { meals.append("夜は\(mStr(log.dinner))") }
+        
+        if !meals.isEmpty {
+            if meals.count == 3 {
+                text += "食事は朝昼夜しっかり食べて、\(meals.joined(separator: "、"))だった。\n"
+            } else {
+                text += "食事は\(meals.joined(separator: "、"))だった。\n"
+            }
+        } else if log.breakfast == "無" && log.lunch == "無" && log.dinner == "無" {
+            text += "今日は食事をとらなかった。\n"
+        }
+        
+        // 4. アクティビティ (酒、運動、睡眠など)
+        var habits = [String]()
+        if log.alcohol == "多" { habits.append("お酒をしっかり飲んだ") }
+        else if log.alcohol == "普" { habits.append("お酒もほどほどに飲んだ") }
+        else if log.alcohol == "少" { habits.append("お酒を少し飲んだ") }
+        else if log.alcohol == "無" { habits.append("お酒は飲まなかった") }
+        
+        if log.exercise == "多" { habits.append("運動もしっかりできた") }
+        else if log.exercise == "普" { habits.append("適度に運動もできた") }
+        else if log.exercise == "少" { habits.append("少し体を動かした") }
+        else if log.exercise == "無" { habits.append("運動はしなかった") }
 
+        if log.sleepQuality == "良い" || log.sleepTime == "8h-" { habits.append("睡眠もばっちりだ") }
+        else if log.sleepQuality == "悪い" || log.sleepTime == "-3h" { habits.append("少し寝不足気味だ") }
+        
+        if !habits.isEmpty {
+            if habits.count >= 2 {
+                let last = habits.removeLast()
+                text += habits.joined(separator: "し、") + "し、" + last + "。\n"
+            } else {
+                text += habits[0] + "。\n"
+            }
+        }
+        
+        // 5. ハイライト、メモ (🌟 ご要望のフォーマットに変更)
+        if !log.goodThing.isEmpty {
+            text += "\n✨良かったこと\n\(log.goodThing)\n"
+        }
+        if !log.memo.isEmpty {
+            text += "\n📝メモ\n\(log.memo)\n"
+        }
+        
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack { Text(dateTitle).font(.headline).foregroundColor(mainColor); Spacer(); Text("\(Int(log.score)) 点").font(.title3).bold().foregroundColor(mainColor) }
+            Divider()
+            Text(generatedText).font(.body).lineSpacing(5).foregroundColor(.primary)
+            if let photoData = log.photoData, let uiImage = UIImage(data: photoData) { Image(uiImage: uiImage).resizable().scaledToFill().frame(height: 150).frame(maxWidth: .infinity).clipped().cornerRadius(10).padding(.top, 5) }
+        }.padding().background(Color.white).cornerRadius(15).shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 2)
+    }
+}
 
-def count_edges(G: nx.DiGraph) -> Tuple[int, int]:
-    direct = hidden = 0
-    for _, _, ed in G.edges(data=True):
-        if any(h.get("is_direct") for h in ed.get("history", [])):
-            direct += 1
-        if any(not h.get("is_direct") for h in ed.get("history", [])):
-            hidden += 1
-    return direct, hidden
+struct FilterSortSheet: View {
+    @Environment(\.dismiss) var dismiss; @Binding var filter: DiaryFilter; let mainColor: Color
+    let activities = ["すべて", "-", "仕事", "遊び", "無"]; let weathers = ["すべて", "-", "☀️", "☁️", "☔️", "☃️"]
+    let levels = ["すべて", "-", "無", "少", "普", "多"]; let meals = ["すべて", "-", "無", "自炊", "購入", "外食"]
+    let sleepTimes = ["すべて", "-", "-3h", "4-6h", "6-8h", "8h-"]; let qualities = ["すべて", "-", "悪い", "普通", "良い"]
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(header: Text("検索・並び替え")) {
+                    Picker("並び順", selection: $filter.sortType) { Text("日付 (新しい順)").tag(SortType.dateDesc); Text("日付 (古い順)").tag(SortType.dateAsc); Text("点数 (高い順)").tag(SortType.scoreDesc); Text("点数 (低い順)").tag(SortType.scoreAsc) }
+                    TextField("キーワード検索", text: $filter.searchText)
+                    HStack { Text("最低点数: \(Int(filter.minScore))点"); Spacer(); Slider(value: $filter.minScore, in: 0...10, step: 1).frame(width: 120).tint(mainColor) }
+                }
+                Section(header: Text("行動・環境")) {
+                    Picker("天気", selection: $filter.weather) { ForEach(weathers, id: \.self) { Text($0) } }
+                    Picker("主にしたこと", selection: $filter.activity) { ForEach(activities, id: \.self) { Text($0) } }
+                    Picker("人との関わり", selection: $filter.social) { ForEach(levels, id: \.self) { Text($0) } }
+                }
+                Section(header: Text("食事")) {
+                    Picker("朝食", selection: $filter.breakfast) { ForEach(meals, id: \.self) { Text($0) } }
+                    Picker("昼食", selection: $filter.lunch) { ForEach(meals, id: \.self) { Text($0) } }
+                    Picker("夕食", selection: $filter.dinner) { ForEach(meals, id: \.self) { Text($0) } }
+                    Picker("肉", selection: $filter.meat) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("魚", selection: $filter.fish) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("野菜", selection: $filter.veg) { ForEach(levels, id: \.self) { Text($0) } }
+                }
+                Section(header: Text("習慣・睡眠")) {
+                    Picker("酒", selection: $filter.alcohol) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("カフェイン", selection: $filter.caffeine) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("タバコ", selection: $filter.tobacco) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("運動", selection: $filter.exercise) { ForEach(levels, id: \.self) { Text($0) } }
+                    Picker("睡眠時間", selection: $filter.sleepTime) { ForEach(sleepTimes, id: \.self) { Text($0) } }
+                    Picker("睡眠の質", selection: $filter.sleepQuality) { ForEach(qualities, id: \.self) { Text($0) } }
+                }
+                Section { Button(action: { filter = DiaryFilter() }) { Text("すべての条件をリセット").foregroundColor(.red).frame(maxWidth: .infinity, alignment: .center) } }
+            }.navigationTitle("絞り込み").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("完了") { dismiss() }.bold().foregroundColor(mainColor) } }
+        }
+    }
+}
 
+// ==========================================
+// 🔍 記録の詳細画面
+// ==========================================
+struct LogDetailView: View {
+    var log: JibunLog; let bgColor: Color; let mainColor: Color
+    var dateTitle: String { let f = DateFormatter(); f.dateFormat = "yyyy/M/d(E)の記録"; f.locale = Locale(identifier: "ja_JP"); return f.string(from: log.date) }
+    @ViewBuilder func readOnlyRow(icon: String, text: String, value: String, color: Color = .primary) -> some View { HStack(spacing: 8) { Image(systemName: icon).foregroundColor(color).frame(width: 24); Text(text); Spacer(); Text(value).bold().foregroundColor(.secondary) }.padding(.vertical, 2) }
 
-# ==========================================
-# 6. 統合関数・HTML一括出力
-# ==========================================
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 20) {
+                    VStack { Text("この日の点数").font(.headline).foregroundColor(mainColor); Text("\(Int(log.score)) 点").font(.system(size: 45, weight: .bold)).foregroundColor(mainColor) }.frame(maxWidth: .infinity).padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { readOnlyRow(icon: "checkmark.circle.fill", text: "主にしたこと", value: log.mainActivity); readOnlyRow(icon: "person.2.fill", text: "人との関わり", value: log.socialInteraction, color: .purple); readOnlyRow(icon: "cloud.fill", text: "天気", value: log.weather, color: .cyan); readOnlyRow(icon: "shoeprints.fill", text: "歩数", value: "\(log.stepCount) 歩") }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "fork.knife"); Text("食事").font(.headline) }; readOnlyRow(icon: "sun.max.fill", text: "朝", value: log.breakfast, color: .orange); readOnlyRow(icon: "sun.haze.fill", text: "昼", value: log.lunch, color: .orange); readOnlyRow(icon: "moon.stars.fill", text: "夜", value: log.dinner, color: .blue); Divider(); readOnlyRow(icon: "frying.pan.fill", text: "肉", value: log.foodMeat); readOnlyRow(icon: "fish.fill", text: "魚", value: log.foodFish, color: .blue); readOnlyRow(icon: "carrot.fill", text: "野菜", value: log.foodVeg, color: .orange) }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "figure.run"); Text("習慣").font(.headline) }; readOnlyRow(icon: "wineglass.fill", text: "酒", value: log.alcohol, color: .purple); readOnlyRow(icon: "mug.fill", text: "カフェイン", value: log.caffeine, color: .brown); readOnlyRow(icon: "smoke.fill", text: "タバコ", value: log.tobacco, color: .gray); readOnlyRow(icon: "dumbbell.fill", text: "運動", value: log.exercise, color: .green) }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "bed.double.fill"); Text("睡眠").font(.headline) }; readOnlyRow(icon: "clock.fill", text: "時間", value: log.sleepTime); readOnlyRow(icon: "star.fill", text: "質", value: log.sleepQuality, color: .yellow) }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "square.and.pencil"); Text("振り返り").font(.headline) }; if !log.goodThing.isEmpty { VStack(alignment: .leading) { Text("よかったこと").font(.caption).foregroundColor(.gray); Text(log.goodThing) } }; if !log.memo.isEmpty { VStack(alignment: .leading) { Text("メモ").font(.caption).foregroundColor(.gray); Text(log.memo) } }; if let photoData = log.photoData, let uiImage = UIImage(data: photoData) { Image(uiImage: uiImage).resizable().scaledToFill().frame(height: 200).frame(maxWidth: .infinity).clipped().cornerRadius(10) } }.padding().background(Color.white).cornerRadius(15)
+                }.padding()
+            }
+        }.navigationTitle(dateTitle).navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { NavigationLink(destination: EditLogView(log: log, bgColor: bgColor, mainColor: mainColor)) { Text("編集").bold().foregroundColor(mainColor) } } }
+    }
+}
 
-def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket: Optional[str]) -> Tuple[str, str, str, str, Dict[str, Any]]:
-    try:
-        current, past_races = scraper.fetch_current_and_past(deba_url, water_filter_bucket)
-        if not current.umaban_dict:
-            return current.title, "データなし", "", "", current.debug
-        G = build_comparison_graph(past_races, current.target_course, current.target_distance, current.umaban_dict, current.is_banei)
-        runners = list(current.umaban_dict.keys())
-        pair_net = compute_pairwise_results(G, runners, current.target_course, current.target_distance, current.is_banei)
-        matchup_matrix = compute_matchup_matrix(pair_net, runners, current.target_course, current.target_distance, current.is_banei)
-        tier_map, ranked, unranked = evaluate_and_rank(pair_net, matchup_matrix, current.umaban_dict)
-        html_out = build_html_output(
-            tier_map,
-            ranked,
-            unranked,
-            current.umaban_dict,
-            pair_net,
-            matchup_matrix,
-            current.target_course,
-            current.target_distance,
-            current.target_water,
-            water_filter_bucket,
-            current.is_banei,
-        )
-        group_direct_html = build_group_direct_html(past_races, current.umaban_dict, current.is_banei)
-        matrix_html = build_matrix_html(matchup_matrix, current.umaban_dict)
-        direct_edges, hidden_edges = count_edges(G)
-        current.debug.update({
-            "past_races_after_filter": len(past_races),
-            "graph_nodes": G.number_of_nodes(),
-            "graph_edges": G.number_of_edges(),
-            "direct_edges": direct_edges,
-            "hidden_edges": hidden_edges,
-            "ranked": len(ranked),
-            "unranked": len(unranked),
-        })
-        return current.title, html_out, group_direct_html, matrix_html, current.debug
-    except Exception as e:
-        return "解析エラー", f"<div style='color:#d83a3a;font-weight:bold;'>エラー: {html.escape(str(e))}</div>", "", "", {"error": str(e), "url": deba_url}
+// ==========================================
+// ➕ 過去の記録を追加する画面
+// ==========================================
+struct AddPastLogView: View {
+    var selectedDate: Date; let bgColor: Color; let mainColor: Color; @Environment(\.modelContext) private var modelContext; @Environment(\.dismiss) private var dismiss; @Query private var logs: [JibunLog]; @StateObject private var healthKitManager = HealthKitManager()
+    
+    @State private var score: Double = 5.0; @State private var mainActivity: String = "-"; @State private var socialInteraction: String = "-"
+    @State private var activityLevel: Double = 3.0; @State private var stepCount: String = ""
+    @State private var breakfast: String = "-"; @State private var lunch: String = "-"; @State private var dinner: String = "-"; @State private var foodMeat: String = "-"; @State private var foodFish: String = "-"; @State private var foodVeg: String = "-"; @State private var alcohol: String = "-"; @State private var caffeine: String = "-"; @State private var tobacco: String = "-"; @State private var exercise: String = "-"; @State private var sleepTime: String = "-"; @State private var sleepQuality: String = "-"; @State private var goodThing: String = ""; @State private var memo: String = ""; @State private var weather: String = "-"; @State private var photoData: Data? = nil; @State private var selectedPhotoItem: PhotosPickerItem? = nil
 
+    let mainActivityOptions = ["-", "仕事", "遊び", "無"]; let levelOptions = ["-", "無", "少", "普", "多"]; let mealOptions = ["-", "無", "自炊", "購入", "外食"]; let sleepTimeOptions = ["-", "-3h", "4-6h", "6-8h", "8h-"]; let qualityOptions = ["-", "悪い", "普通", "良い"]
 
-def wrap_combined_html(results: List[Tuple[int, str, str, str, str, Dict[str, Any]]]) -> str:
-    tabs, contents = "", ""
-    for i, (r_num, title, body, group_direct, matrix, debug) in enumerate(results):
-        active = "active" if i == 0 else ""
-        tabs += f'<button class="tab-btn {active}" onclick="openRaceTab(event, \'race_{r_num}\')">{r_num}R</button>\n'
-        contents += f"""
-        <div id='race_{r_num}' class='tab-content {active}'>
-          <h2>📊 {html.escape(title)}</h2>
-          <div class='sub-tab-buttons'>
-            <button class='sub-tab-btn active' onclick="openSubTab(event, 'race_{r_num}_rank')">ランク判定</button>
-            <button class='sub-tab-btn' onclick="openSubTab(event, 'race_{r_num}_direct3')">3頭以上直接対決</button>
-            <button class='sub-tab-btn' onclick="openSubTab(event, 'race_{r_num}_matrix')">対戦マトリクス</button>
-          </div>
-          <div id='race_{r_num}_rank' class='sub-tab-content active'>{body}</div>
-          <div id='race_{r_num}_direct3' class='sub-tab-content'>{group_direct}</div>
-          <div id='race_{r_num}_matrix' class='sub-tab-content'><h3>対戦マトリクス</h3>{matrix}</div>
-        </div>
-        """
-    return f"""<!DOCTYPE html>
-<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NAR公式 物差し能力比較</title>
-<style>
-body {{ font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif; background:#f7f6f2; padding:20px; }}
-.container {{ background:#fff; padding:20px; border-radius:10px; max-width:1100px; margin:auto; box-shadow:0 2px 10px rgba(0,0,0,.10); }}
-.tab-buttons,.sub-tab-buttons {{ display:flex; gap:5px; border-bottom:2px solid #3498db; margin-bottom:16px; flex-wrap:wrap; }}
-.sub-tab-buttons {{ border-bottom-color:#9aa8b8; margin-top:8px; }}
-.tab-btn,.sub-tab-btn {{ padding:10px 16px; border:none; background:#ecf0f1; cursor:pointer; font-weight:bold; border-radius:4px 4px 0 0; }}
-.tab-btn.active {{ background:#3498db; color:white; }}
-.sub-tab-btn.active {{ background:#596a7d; color:white; }}
-.tab-content,.sub-tab-content {{ display:none; }} .tab-content.active,.sub-tab-content.active {{ display:block; }}
-a {{ color:#0b65c2; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
-</style></head><body><div class="container"><div class="tab-buttons">{tabs}</div>{contents}</div>
-<script>
-function openRaceTab(evt, id) {{
-  document.querySelectorAll('.tab-content, .tab-btn').forEach(e => e.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-  evt.currentTarget.classList.add('active');
-}}
-function openSubTab(evt, id) {{
-  const parent = evt.currentTarget.closest('.tab-content');
-  parent.querySelectorAll('.sub-tab-content, .sub-tab-btn').forEach(e => e.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-  evt.currentTarget.classList.add('active');
-}}
-</script></body></html>"""
+    @ViewBuilder func rowLabel(icon: String, text: String, color: Color = .primary) -> some View { HStack(spacing: 8) { Image(systemName: icon).foregroundColor(color).frame(width: 24); Text(text); Spacer() }.frame(width: 80) }
 
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 30) {
+                    VStack { HStack { Text("記録の点数").font(.headline).foregroundColor(.white); Spacer(); Text("\(Int(score)) 点").font(.title2).bold().foregroundColor(.white) }; Slider(value: $score, in: 0...10, step: 1).tint(.white) }.padding().background(mainColor).cornerRadius(15).shadow(color: mainColor.opacity(0.4), radius: 8, x: 0, y: 4)
+                    
+                    VStack(alignment: .leading, spacing: 15) { Picker("主にしたこと", selection: $mainActivity) { ForEach(mainActivityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented); if mainActivity == "仕事" || mainActivity == "遊び" { Slider(value: $activityLevel, in: 1...5, step: 1).tint(mainColor) }; HStack { rowLabel(icon: "person.2.fill", text: "人との関わり", color: .purple); Spacer(); Picker("", selection: $socialInteraction) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; Divider(); HStack { rowLabel(icon: "cloud.fill", text: "天気", color: .cyan); Spacer(); Picker("", selection: $weather) { Text("-").tag("-"); Image(systemName: "sun.max.fill").tag("☀️"); Image(systemName: "cloud.fill").tag("☁️"); Image(systemName: "cloud.rain.fill").tag("☔️"); Image(systemName: "snowflake").tag("☃️") }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "shoeprints.fill", text: "歩数"); Spacer(); TextField("歩数", text: $stepCount).keyboardType(.numberPad).textFieldStyle(RoundedBorderTextFieldStyle()).frame(width: 100); Text("歩") } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "fork.knife"); Text("食事").font(.headline) }; HStack { rowLabel(icon: "sun.max.fill", text: "朝", color: .orange); Spacer(); Picker("", selection: $breakfast) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "sun.haze.fill", text: "昼", color: .orange); Spacer(); Picker("", selection: $lunch) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "moon.stars.fill", text: "夜", color: .blue); Spacer(); Picker("", selection: $dinner) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; Divider(); HStack { rowLabel(icon: "frying.pan.fill", text: "肉"); Spacer(); Picker("", selection: $foodMeat) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "fish.fill", text: "魚", color: .blue); Spacer(); Picker("", selection: $foodFish) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "carrot.fill", text: "野菜", color: .orange); Spacer(); Picker("", selection: $foodVeg) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "figure.run"); Text("習慣").font(.headline) }; HStack { rowLabel(icon: "wineglass.fill", text: "酒", color: .purple); Spacer(); Picker("", selection: $alcohol) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "mug.fill", text: "カフェイン", color: .brown); Spacer(); Picker("", selection: $caffeine) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "smoke.fill", text: "タバコ", color: .gray); Spacer(); Picker("", selection: $tobacco) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "dumbbell.fill", text: "運動", color: .green); Spacer(); Picker("", selection: $exercise) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "bed.double.fill"); Text("睡眠").font(.headline) }; HStack { rowLabel(icon: "clock.fill", text: "時間"); Spacer(); Picker("", selection: $sleepTime) { ForEach(sleepTimeOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "star.fill", text: "質", color: .yellow); Spacer(); Picker("", selection: $sleepQuality) { ForEach(qualityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "square.and.pencil"); Text("振り返り").font(.headline) }; TextField("今日良かったこと（30文字以内）", text: $goodThing).textFieldStyle(RoundedBorderTextFieldStyle()).onChange(of: goodThing) { _, newValue in if newValue.count > 30 { goodThing = String(newValue.prefix(30)) } }; TextEditor(text: $memo).frame(height: 100).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.3), lineWidth: 1)); PhotosPicker(selection: $selectedPhotoItem, matching: .images) { HStack { Image(systemName: "photo.on.rectangle.angled"); Text(photoData == nil ? "今日の1枚を追加" : "写真を変更する") }.foregroundColor(mainColor).frame(maxWidth: .infinity).padding().background(mainColor.opacity(0.1)).cornerRadius(10) }.onChange(of: selectedPhotoItem) { _, newValue in Task { if let data = try? await newValue?.loadTransferable(type: Data.self) { photoData = data } } }; if let photoData, let uiImage = UIImage(data: photoData) { Image(uiImage: uiImage).resizable().scaledToFill().frame(height: 200).frame(maxWidth: .infinity).clipped().cornerRadius(10) } }.padding().background(Color.white).cornerRadius(15)
+                    
+                    Button(action: {
+                        if let existingLog = logs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: selectedDate) }) { modelContext.delete(existingLog) }
+                        let newLog = JibunLog(date: selectedDate, score: score, mainActivity: mainActivity, activityLevel: Int(activityLevel), stepCount: stepCount, breakfast: breakfast, lunch: lunch, dinner: dinner, foodMeat: foodMeat, foodFish: foodFish, foodVeg: foodVeg, alcohol: alcohol, caffeine: caffeine, tobacco: tobacco, exercise: exercise, sleepTime: sleepTime, sleepQuality: sleepQuality, goodThing: goodThing, memo: memo, photoData: photoData, weather: weather, socialInteraction: socialInteraction)
+                        modelContext.insert(newLog)
+                        
+                        AppNotificationManager.shared.updateNotifications(logs: logs)
+                        dismiss()
+                    }) { Text("過去の記録を保存する").font(.headline).foregroundColor(.white).frame(maxWidth: .infinity).padding(.vertical, 16).background(mainColor).cornerRadius(15) }.padding(.bottom, 40)
+                }.padding(.horizontal, 20).padding(.top, 20)
+            }
+        }.navigationTitle({ let f = DateFormatter(); f.dateFormat = "M/d(E)の記録を追加"; f.locale = Locale(identifier: "ja_JP"); return f.string(from: selectedDate) }()).onAppear { healthKitManager.fetchSteps(for: selectedDate) { fetchedSteps in self.stepCount = fetchedSteps } }
+    }
+}
 
+// ==========================================
+// ✏️ 編集画面
+// ==========================================
+struct EditLogView: View {
+    @Bindable var log: JibunLog; let bgColor: Color; let mainColor: Color; @State private var selectedPhotoItem: PhotosPickerItem? = nil; @Query private var logs: [JibunLog]
+    let mainActivityOptions = ["-", "仕事", "遊び", "無"]; let levelOptions = ["-", "無", "少", "普", "多"]; let mealOptions = ["-", "無", "自炊", "購入", "外食"]; let sleepTimeOptions = ["-", "-3h", "4-6h", "6-8h", "8h-"]; let qualityOptions = ["-", "悪い", "普通", "良い"]
+    @ViewBuilder func rowLabel(icon: String, text: String, color: Color = .primary) -> some View { HStack(spacing: 8) { Image(systemName: icon).foregroundColor(color).frame(width: 24); Text(text); Spacer() }.frame(width: 80) }
 
-# ==========================================
-# 7. Streamlit UI
-# ==========================================
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            ScrollView {
+                VStack(spacing: 30) {
+                    VStack(alignment: .leading) { Text("日付の変更").font(.headline); DatePicker("日付", selection: $log.date, displayedComponents: .date).labelsHidden().environment(\.locale, Locale(identifier: "ja_JP")) }.padding().background(Color.white).cornerRadius(15)
+                    VStack { HStack { Text("今日の点数").font(.headline).foregroundColor(.white); Spacer(); Text("\(Int(log.score)) 点").font(.title2).bold().foregroundColor(.white) }; Slider(value: $log.score, in: 0...10, step: 1).tint(.white) }.padding().background(mainColor).cornerRadius(15).shadow(color: mainColor.opacity(0.4), radius: 8, x: 0, y: 4)
+                    
+                    VStack(alignment: .leading, spacing: 15) { Picker("主にしたこと", selection: $log.mainActivity) { ForEach(mainActivityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented); if log.mainActivity == "仕事" || log.mainActivity == "遊び" { Text("充実度・忙しさ: \(log.activityLevel)").font(.subheadline); Slider(value: Binding(get: { Double(log.activityLevel) }, set: { log.activityLevel = Int($0) }), in: 1...5, step: 1).tint(mainColor) }; HStack { rowLabel(icon: "person.2.fill", text: "人との関わり", color: .purple); Spacer(); Picker("", selection: $log.socialInteraction) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; Divider(); HStack { rowLabel(icon: "cloud.fill", text: "天気", color: .cyan); Spacer(); Picker("", selection: $log.weather) { Text("-").tag("-"); Image(systemName: "sun.max.fill").tag("☀️"); Image(systemName: "cloud.fill").tag("☁️"); Image(systemName: "cloud.rain.fill").tag("☔️"); Image(systemName: "snowflake").tag("☃️") }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "shoeprints.fill", text: "歩数"); Spacer(); TextField("歩数", text: $log.stepCount).keyboardType(.numberPad).textFieldStyle(RoundedBorderTextFieldStyle()).frame(width: 100); Text("歩") } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "fork.knife"); Text("食事").font(.headline) }; HStack { rowLabel(icon: "sun.max.fill", text: "朝", color: .orange); Spacer(); Picker("", selection: $log.breakfast) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "sun.haze.fill", text: "昼", color: .orange); Spacer(); Picker("", selection: $log.lunch) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "moon.stars.fill", text: "夜", color: .blue); Spacer(); Picker("", selection: $log.dinner) { ForEach(mealOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; Divider(); HStack { rowLabel(icon: "frying.pan.fill", text: "肉"); Spacer(); Picker("", selection: $log.foodMeat) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "fish.fill", text: "魚", color: .blue); Spacer(); Picker("", selection: $log.foodFish) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "carrot.fill", text: "野菜", color: .orange); Spacer(); Picker("", selection: $log.foodVeg) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "figure.run"); Text("習慣・アクティビティ").font(.headline) }; HStack { rowLabel(icon: "wineglass.fill", text: "酒", color: .purple); Spacer(); Picker("", selection: $log.alcohol) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "mug.fill", text: "カフェイン", color: .brown); Spacer(); Picker("", selection: $log.caffeine) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "smoke.fill", text: "タバコ", color: .gray); Spacer(); Picker("", selection: $log.tobacco) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "dumbbell.fill", text: "運動", color: .green); Spacer(); Picker("", selection: $log.exercise) { ForEach(levelOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "bed.double.fill"); Text("睡眠").font(.headline) }; HStack { rowLabel(icon: "clock.fill", text: "時間"); Spacer(); Picker("", selection: $log.sleepTime) { ForEach(sleepTimeOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) }; HStack { rowLabel(icon: "star.fill", text: "質", color: .yellow); Spacer(); Picker("", selection: $log.sleepQuality) { ForEach(qualityOptions, id: \.self) { Text($0) } }.pickerStyle(.segmented) } }.padding().background(Color.white).cornerRadius(15)
+                    VStack(alignment: .leading, spacing: 15) { HStack { Image(systemName: "square.and.pencil"); Text("振り返り").font(.headline) }; TextField("今日良かったこと（30文字以内）", text: $log.goodThing).textFieldStyle(RoundedBorderTextFieldStyle()).onChange(of: log.goodThing) { _, newValue in if newValue.count > 30 { log.goodThing = String(newValue.prefix(30)) } }; TextEditor(text: $log.memo).frame(height: 100).overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.3), lineWidth: 1)); PhotosPicker(selection: $selectedPhotoItem, matching: .images) { HStack { Image(systemName: "photo.on.rectangle.angled"); Text(log.photoData == nil ? "写真を追加" : "写真を変更する") }.foregroundColor(mainColor).frame(maxWidth: .infinity).padding().background(mainColor.opacity(0.1)).cornerRadius(10) }.onChange(of: selectedPhotoItem) { _, newValue in Task { if let data = try? await newValue?.loadTransferable(type: Data.self) { log.photoData = data } } }; if let photoData = log.photoData, let uiImage = UIImage(data: photoData) { Image(uiImage: uiImage).resizable().scaledToFill().frame(height: 200).frame(maxWidth: .infinity).clipped().cornerRadius(10) } }.padding().background(Color.white).cornerRadius(15)
+                }.padding(.horizontal, 20).padding(.vertical, 20)
+            }
+        }.navigationTitle("記録の編集")
+        .onDisappear { AppNotificationManager.shared.updateNotifications(logs: logs) }
+    }
+}
 
-st.set_page_config(page_title="NAR公式 物差し能力比較", page_icon="🏇", layout="wide")
-st.title("🏇 NAR公式 物差し能力比較")
-st.caption("地方競馬専用 / NAR公式から取得 / 直接対決を最重要視 / 3頭以上直接対決タブ / ばんえい水分量フィルタ対応")
+// ==========================================
+// ⚙️ 設定画面
+// ==========================================
+struct SettingsView: View {
+    let bgColor: Color; let mainColor: Color
+    @Environment(\.modelContext) private var modelContext; @Query private var logs: [JibunLog]
+    
+    @AppStorage("themeColorIndex") private var themeColorIndex = 0; @AppStorage("nickname") private var nickname = ""; @AppStorage("birthday") private var birthday = Date(); @AppStorage("postalCode") private var postalCode = ""; @AppStorage("isNotificationEnabled") private var isNotificationEnabled = true; @AppStorage("notificationHour") private var notificationHour = 23; @AppStorage("notificationMinute") private var notificationMinute = 0; @State private var notificationTime: Date = Date()
+    @State private var showFileImporter = false; @State private var importMessage = ""; @State private var showImportAlert = false
+    
+    var body: some View {
+        ZStack {
+            bgColor.ignoresSafeArea()
+            Form {
+                Section(header: Text("プロフィール").font(.headline)) { TextField("ニックネーム", text: $nickname); DatePicker("誕生日", selection: $birthday, displayedComponents: .date).environment(\.locale, Locale(identifier: "ja_JP")); TextField("郵便番号", text: $postalCode).keyboardType(.numberPad) }
+                Section(header: Text("アプリのデザイン").font(.headline)) { Picker("テーマカラー", selection: $themeColorIndex) { ForEach(ThemeColor.allCases) { theme in HStack { Circle().fill(theme.color).frame(width: 20, height: 20); Text(theme.name) }.tag(theme.rawValue) } }.pickerStyle(.navigationLink) }
+                Section(header: Text("リマインド通知").font(.headline)) {
+                    Toggle("毎日記録をお知らせ", isOn: $isNotificationEnabled).tint(mainColor)
+                        .onChange(of: isNotificationEnabled) { _, _ in AppNotificationManager.shared.updateNotifications(logs: logs) }
+                    if isNotificationEnabled {
+                        DatePicker("通知の時間", selection: $notificationTime, displayedComponents: .hourAndMinute).environment(\.locale, Locale(identifier: "ja_JP"))
+                            .onChange(of: notificationTime) { _, newValue in
+                                let components = Calendar.current.dateComponents([.hour, .minute], from: newValue)
+                                notificationHour = components.hour ?? 23; notificationMinute = components.minute ?? 0
+                                AppNotificationManager.shared.updateNotifications(logs: logs)
+                            }
+                    }
+                }
+                Section(header: Text("データ管理").font(.headline), footer: Text("Excel等で編集したCSVを一括で取り込むことができます。")) { if let csvURL = generateCSV() { ShareLink(item: csvURL, message: Text("自分ログのデータです")) { HStack { Image(systemName: "square.and.arrow.up"); Text("CSVデータを書き出す") }.foregroundColor(mainColor) } }; Button(action: { showFileImporter = true }) { HStack { Image(systemName: "square.and.arrow.down"); Text("CSVデータを取り込む") }.foregroundColor(mainColor) } }
+                Section(header: Text("アプリについて"), footer: Text("Jibunlog v1.0")) { HStack { Text("開発者"); Spacer(); Text("K").foregroundColor(.gray) } }
+            }.scrollContentBackground(.hidden)
+        }
+        .navigationTitle("設定").navigationBarTitleDisplayMode(.inline)
+        .onAppear { notificationTime = Calendar.current.date(bySettingHour: notificationHour, minute: notificationMinute, second: 0, of: Date()) ?? Date() }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.commaSeparatedText]) { result in switch result { case .success(let file): importCSV(from: file); case .failure(let error): importMessage = "ファイルの選択に失敗しました: \(error.localizedDescription)"; showImportAlert = true } }
+        .alert(isPresented: $showImportAlert) { Alert(title: Text("結果"), message: Text(importMessage), dismissButton: .default(Text("OK"))) }
+    }
+    
+    private func generateCSV() -> URL? {
+        var csvString = "日付,点数,天気,行動,充実度,歩数,朝食,昼食,夕食,肉,魚,野菜,酒,カフェイン,タバコ,運動,睡眠時間,睡眠の質,よかったこと,メモ,人との関わり\n"
+        let formatter = DateFormatter(); formatter.dateFormat = "yyyy/MM/dd"
+        for log in logs {
+            let dateStr = formatter.string(from: log.date)
+            let safeGoodThing = log.goodThing.replacingOccurrences(of: ",", with: "，").replacingOccurrences(of: "\n", with: " ")
+            let safeMemo = log.memo.replacingOccurrences(of: ",", with: "，").replacingOccurrences(of: "\n", with: " ")
+            let row = "\(dateStr),\(log.score),\(log.weather),\(log.mainActivity),\(log.activityLevel),\(log.stepCount),\(log.breakfast),\(log.lunch),\(log.dinner),\(log.foodMeat),\(log.foodFish),\(log.foodVeg),\(log.alcohol),\(log.caffeine),\(log.tobacco),\(log.exercise),\(log.sleepTime),\(log.sleepQuality),\(safeGoodThing),\(safeMemo),\(log.socialInteraction)\n"
+            csvString.append(row)
+        }
+        let fileName = "Jibunlog_Data.csv"
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do { try csvString.write(to: tempURL, atomically: true, encoding: .utf8); return tempURL } catch { return nil }
+    }
+    
+    private func importCSV(from url: URL) {
+        guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }
+        do {
+            let data = try String(contentsOf: url, encoding: .utf8); let rows = data.components(separatedBy: "\n")
+            let formatter = DateFormatter(); formatter.dateFormat = "yyyy/MM/dd"; var successCount = 0
+            for (index, row) in rows.enumerated() {
+                if index == 0 { continue }
+                if row.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                let columns = row.components(separatedBy: ",")
+                if columns.count >= 21 {
+                    if let date = formatter.date(from: columns[0]), let score = Double(columns[1]) {
+                        if let existingLog = logs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) { modelContext.delete(existingLog) }
+                        let newLog = JibunLog(date: date, score: score, mainActivity: columns[3], activityLevel: Int(columns[4]) ?? 3, stepCount: columns[5], breakfast: columns[6], lunch: columns[7], dinner: columns[8], foodMeat: columns[9], foodFish: columns[10], foodVeg: columns[11], alcohol: columns[12], caffeine: columns[13], tobacco: columns[14], exercise: columns[15], sleepTime: columns[16], sleepQuality: columns[17], goodThing: columns[18], memo: columns[19], photoData: nil, weather: columns[2], socialInteraction: columns[20])
+                        modelContext.insert(newLog); successCount += 1
+                    }
+                }
+            }
+            importMessage = "\(successCount) 件のデータを無事に取り込みました！"; showImportAlert = true
+            AppNotificationManager.shared.updateNotifications(logs: logs)
+        } catch { importMessage = "ファイルの読み込みに失敗しました。"; showImportAlert = true }
+    }
+}
 
-with st.expander("重要な変更点", expanded=False):
-    st.markdown(
-        """
-- netkeiba馬柱では、地方・ばんえいで父馬名を拾ってしまうケースがあるため、出走馬名はNAR公式の出馬表から取得します。
-- 過去5走リンクもNAR公式の出馬表から拾い、比較用の全頭結果はNAR公式の成績表（RaceMarkTable）から取得します。
-- ばんえいは水分量を `2.0%未満` / `2.0%以上` に分け、チェック時は比較対象レースも同じ区分だけに絞ります。\n- 直接対決は経由比較より大きく重くランクへ反映します。\n- ばんえいの不等号は一律で `5秒未満=`, `5秒以上15秒未満 >/<`, `15秒以上 >>/<<` です。
-        """
-    )
-
-url_input = st.text_input(
-    "NAR公式の出馬表URL",
-    value="https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2f04%2f26&k_raceNo=1&k_babaCode=3",
-    placeholder="https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2f04%2f26&k_raceNo=1&k_babaCode=3",
-)
-
-st.markdown("---")
-use_banei_water_filter = st.checkbox(
-    "ばんえい水分量フィルタを使う（2.0%未満 / 2.0%以上で比較対象を絞る）",
-    value=True,
-)
-water_mode = st.radio(
-    "フィルタ対象",
-    ["現在レースと同じ区分", "2.0%未満", "2.0%以上"],
-    horizontal=True,
-)
-
-st.markdown("---")
-st.write("分析するレース番号。未選択ならURLのレースだけ分析します。")
-cols = st.columns(12)
-selected_races: List[int] = []
-for i in range(12):
-    with cols[i]:
-        if st.checkbox(f"{i + 1}R", key=f"race_{i + 1}"):
-            selected_races.append(i + 1)
-
-submitted = st.button("🚀 分析を開始", type="primary")
-
-if submitted:
-    if not url_input.strip():
-        st.error("NAR公式の出馬表URLを入力してください。")
-        st.stop()
-
-    scraper = NarOfficialScraper()
-    key = scraper.parse_key_from_url(url_input.strip())
-    if not key:
-        st.error("URLから k_raceDate / k_raceNo / k_babaCode を抽出できませんでした。NAR公式の出馬表URLを入れてください。")
-        st.stop()
-
-    if not selected_races:
-        selected_races = [key.race_no]
-
-    results: List[Tuple[int, str, str, str, str, Dict[str, Any]]] = []
-    progress = st.progress(0.0)
-    status = st.empty()
-
-    for idx, rno in enumerate(selected_races):
-        race_key = NarRaceKey(race_date=key.race_date, race_no=rno, baba_code=key.baba_code)
-        deba_url = scraper.build_deba_url(race_key)
-
-        # 「現在レースと同じ区分」を使う場合は、先に現在レースだけ軽く読んで水分量を決める。
-        water_bucket_for_race: Optional[str] = None
-        if use_banei_water_filter:
-            if water_mode == "2.0%未満":
-                water_bucket_for_race = "lt2"
-            elif water_mode == "2.0%以上":
-                water_bucket_for_race = "ge2"
-            else:
-                try:
-                    cur = scraper.parse_current_deba(deba_url)
-                    if cur.is_banei:
-                        water_bucket_for_race = water_bucket(cur.target_water)
-                except Exception:
-                    water_bucket_for_race = None
-
-        status.info(f"🏇 {rno}R 解析中... 水分量フィルタ={water_bucket_label(water_bucket_for_race)}")
-        title, body, group_direct, matrix, debug = analyze_race(scraper, deba_url, water_bucket_for_race)
-        results.append((rno, title, body, group_direct, matrix, debug))
-        progress.progress((idx + 1) / len(selected_races))
-
-    status.empty()
-    st.success("✅ 分析完了")
-
-    combined = wrap_combined_html(results)
-    st.download_button(
-        "📥 HTML一括ダウンロード",
-        combined,
-        file_name=f"NAR公式_物差し能力比較_{key.race_date.replace('/', '')}.html",
-        mime="text/html",
-    )
-
-    tabs = st.tabs([f"{r[0]}R" for r in results])
-    for tab, (r_num, title, body, group_direct, matrix, debug) in zip(tabs, results):
-        with tab:
-            st.markdown(f"### {title}")
-            sub_tabs = st.tabs(["ランク判定", "3頭以上直接対決", "対戦マトリクス"])
-            with sub_tabs[0]:
-                st.markdown(body, unsafe_allow_html=True)
-            with sub_tabs[1]:
-                st.markdown(group_direct, unsafe_allow_html=True)
-            with sub_tabs[2]:
-                st.markdown(matrix, unsafe_allow_html=True)
+// ==========================================
+// 🪄 カレンダー魔法陣
+// ==========================================
+struct CustomCalendarView: UIViewRepresentable {
+    @Binding var selectedDate: Date; var logs: [JibunLog]; var mainColor: Color
+    func makeUIView(context: Context) -> UICalendarView {
+        let view = UICalendarView(); view.calendar = Calendar.current; view.locale = Locale(identifier: "ja_JP"); view.fontDesign = .rounded; view.tintColor = UIColor(mainColor)
+        let selection = UICalendarSelectionSingleDate(delegate: context.coordinator)
+        selection.selectedDate = Calendar.current.dateComponents([.year, .month, .day], from: selectedDate)
+        view.selectionBehavior = selection; view.delegate = context.coordinator
+        return view
+    }
+    func updateUIView(_ uiView: UICalendarView, context: Context) {
+        uiView.tintColor = UIColor(mainColor)
+        context.coordinator.parent = self
+        let selectedComponents = Calendar.current.dateComponents([.year, .month, .day], from: selectedDate)
+        uiView.reloadDecorations(forDateComponents: [selectedComponents], animated: true)
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+    
+    class Coordinator: NSObject, UICalendarViewDelegate, UICalendarSelectionSingleDateDelegate {
+        var parent: CustomCalendarView
+        init(_ parent: CustomCalendarView) { self.parent = parent }
+        func dateSelection(_ selection: UICalendarSelectionSingleDate, didSelectDate dateComponents: DateComponents?) { if let date = dateComponents?.date { parent.selectedDate = date } }
+        
+        func calendarView(_ calendarView: UICalendarView, decorationFor dateComponents: DateComponents) -> UICalendarView.Decoration? {
+            guard let date = dateComponents.date else { return nil }
+            if let log = parent.logs.first(where: { Calendar.current.isDate($0.date, inSameDayAs: date) }) {
+                let scoreInt = max(0, min(10, Int(log.score)))
+                return .image(UIImage(systemName: "\(scoreInt).circle.fill"), color: UIColor(self.parent.mainColor), size: .large)
+            }
+            return nil
+        }
+    }
+}
