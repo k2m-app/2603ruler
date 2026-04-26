@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-NAR公式サイト専用 物差し能力比較 Streamlit版
+NAR公式サイト専用 物差し能力比較 Streamlit版 v7
 
 目的:
 - netkeiba側で親馬名を拾ってしまう問題を回避するため、出走馬名・過去走リンク・過去成績をNAR公式から取得する
@@ -9,7 +9,7 @@ NAR公式サイト専用 物差し能力比較 Streamlit版
 
 起動:
     pip install streamlit requests beautifulsoup4 networkx
-    streamlit run nar_official_relative_app.py
+    streamlit run nar_official_relative_app_v7.py
 
 入力URL例:
     https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2f04%2f26&k_raceNo=1&k_babaCode=3
@@ -466,7 +466,19 @@ class NarOfficialScraper:
         }
 
     def _row_has_current_horse_link(self, row) -> bool:
-        return any(href_has(a.get("href", ""), "DataRoom/HorseMarkInfo") for a in row.find_all("a", href=True))
+        """出馬表の「1頭の開始行」判定。
+
+        v6までは DataRoom/HorseMarkInfo を含む行全般を馬行扱いしていたが、
+        NAR公式は外枠で同枠2頭になると、2頭目の開始行に枠番セルが無い/崩れるケースがある。
+        そのため「数字が2つで始まる」などの条件を併用すると、外枠2頭目だけ落ちる。
+
+        DebaTableの出走馬名は a.horseName に入るので、ここだけを開始行の正とする。
+        """
+        if row is None:
+            return False
+        if row.find("a", class_="horseName") is not None:
+            return True
+        return False
 
     def _row_race_links(self, row) -> List[str]:
         urls: List[str] = []
@@ -479,12 +491,26 @@ class NarOfficialScraper:
         return urls
 
     def _extract_umaban_from_row(self, row, horse_name: str, fallback_no: int) -> str:
+        """現在の馬番を取得。
+
+        最優先はNAR公式の td.horseNum。
+        外枠で同枠2頭になると、枠番セルが無かったり、行頭が「8 9」ではなく「9」だけに見えることがあるため、
+        文字列先頭の数字2個前提にはしない。
+        """
+        horse_num_cell = row.find("td", class_=lambda c: c and "horseNum" in str(c))
+        if horse_num_cell:
+            m = re.search(r"\d{1,2}", clean_text(horse_num_cell))
+            if m:
+                return m.group(0)
+
         row_text = clean_text(row)
-        prefix = row_text.split(clean_text(horse_name))[0]
+        horse_label = clean_text(horse_name)
+        prefix = row_text.split(horse_label)[0] if horse_label in row_text else row_text[:30]
         nums = re.findall(r"(?<![\d.])\d{1,2}(?![\d.])", prefix)
         if nums:
+            # 枠番+馬番の両方がある場合は最後、馬番だけの場合も最後でOK
             return nums[-1]
-        # cellベースの保険
+
         cells = [clean_text(td) for td in row.find_all(["td", "th"])]
         small_nums = [c for c in cells[:5] if re.fullmatch(r"\d{1,2}", c)]
         if small_nums:
@@ -503,11 +529,11 @@ class NarOfficialScraper:
         rows = soup.find_all("tr")
         horse_rows: List[Tuple[int, Any]] = []
         for idx, row in enumerate(rows):
+            # DebaTableの出走馬開始行は a.horseName を持つ。
+            # v6のように「行頭に数字が2個あること」を条件にすると、
+            # 8枠2頭目などで外枠馬が丸ごと欠落するため、ここでは絶対に追加条件を置かない。
             if self._row_has_current_horse_link(row):
-                # 競走馬行以外の馬情報欄を避けるため、RaceMarkTableリンクまたは馬番らしき数字がある行を採用
-                row_text = clean_text(row)
-                if self._row_race_links(row) or re.search(r"^\s*\d+\s+\d+\s+", row_text):
-                    horse_rows.append((idx, row))
+                horse_rows.append((idx, row))
 
         umaban_dict: Dict[str, str] = {}
         past_links: List[PastLink] = []
@@ -516,10 +542,12 @@ class NarOfficialScraper:
 
         for order, (idx, row) in enumerate(horse_rows, start=1):
             horse_link = None
-            for a in row.find_all("a", href=True):
-                if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
-                    horse_link = a
-                    break
+            horse_link = row.find("a", class_="horseName")
+            if horse_link is None:
+                for a in row.find_all("a", href=True):
+                    if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
+                        horse_link = a
+                        break
             if not horse_link:
                 continue
             horse_name = normalize_name(clean_text(horse_link))
@@ -658,10 +686,12 @@ class NarOfficialScraper:
 
         for row in soup.find_all("tr"):
             horse_link = None
-            for a in row.find_all("a", href=True):
-                if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
-                    horse_link = a
-                    break
+            horse_link = row.find("a", class_="horseName")
+            if horse_link is None:
+                for a in row.find_all("a", href=True):
+                    if href_has(a.get("href", ""), "DataRoom/HorseMarkInfo"):
+                        horse_link = a
+                        break
             if not horse_link:
                 continue
             horse_name = normalize_name(clean_text(horse_link))
