@@ -758,6 +758,13 @@ def thresholds(is_banei: bool, is_strict: bool) -> Tuple[float, float]:
     return (0.55, 1.05) if is_strict else (0.75, 1.25)
 
 
+def _safe_rank(rank: Any) -> int:
+    try:
+        return int(rank)
+    except (TypeError, ValueError):
+        return 99
+
+
 def build_comparison_graph(
     past_races: List[RaceInfo],
     target_course: str,
@@ -777,8 +784,11 @@ def build_comparison_graph(
             h1, h2 = h2, h1
             raw_diff_seconds = -raw_diff_seconds
 
-        cap = 30.0 if is_banei else 8.0
-        capped = max(-cap, min(cap, raw_diff_seconds))
+        if is_banei:
+            capped = max(-30.0, min(30.0, raw_diff_seconds))
+        else:
+            # keiba_bot.py の相対比較と同じく、極端な大敗差で序列が壊れないよう非対称に丸める。
+            capped = max(-1.0, min(1.5, raw_diff_seconds))
         r_dist = int(race.distance) if str(race.distance).isdigit() else 0
         is_same_place = race.course == target_course
         is_exact = is_same_place and r_dist == cur_dist
@@ -835,11 +845,19 @@ def build_comparison_graph(
                 add_edge(h1, h2, t1 - t2, race, False)
 
     for _, _, d in G.edges(data=True):
-        d["history"].sort(key=lambda x: x["date"] if isinstance(x["date"], datetime) else datetime.min, reverse=True)
+        def hist_rank(hi: Dict[str, Any]) -> int:
+            ranks = [_safe_rank(hi.get("rank_a")), _safe_rank(hi.get("rank_b"))]
+            return min(ranks) if ranks else 99
+
+        def hist_date(hi: Dict[str, Any]) -> datetime:
+            dt = hi.get("date")
+            return dt if isinstance(dt, datetime) else datetime.min
+
+        d["history"].sort(key=lambda x: (hist_rank(x), -hist_date(x).timestamp() if hist_date(x) != datetime.min else 0))
         seen = set()
         deduped = []
         for hi in d["history"]:
-            key = hi.get("url") or (hi.get("date_str"), hi.get("title"))
+            key = (hi.get("place", ""), hi.get("dist", ""))
             if key in seen:
                 continue
             seen.add(key)
@@ -876,7 +894,69 @@ def advantage_entries_from_edge(G: nx.DiGraph, u: str, v: str) -> List[Dict[str,
 
 def _entry_sort_date(e: Dict[str, Any]) -> datetime:
     dt = e.get("date")
-    return dt if isinstance(dt, datetime) else datetime.min
+    if isinstance(dt, datetime):
+        return dt
+    if isinstance(dt, str):
+        return parse_date_any(dt)
+    return datetime.min
+
+
+def _rank_sort_key(rank: Any, dt: Any) -> Tuple[int, float]:
+    dt_obj = dt if isinstance(dt, datetime) else parse_date_any(str(dt or ""))
+    return (_safe_rank(rank), -dt_obj.timestamp() if dt_obj != datetime.min else 0.0)
+
+
+def _ooi_track_side(dist: Any) -> str:
+    if is_ooi_inner(dist):
+        return "inner"
+    if is_ooi_outer(dist):
+        return "outer"
+    return ""
+
+
+def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> int:
+    d = int(dist) if str(dist).isdigit() else 0
+    cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
+    if not place or d <= 0 or cur_dist <= 0:
+        return 0
+    if place == target_course:
+        if d == cur_dist:
+            return 3
+        if place == "大井" and _ooi_track_side(d) != _ooi_track_side(cur_dist):
+            return 0
+        return 2
+    if d == cur_dist:
+        return 1
+    return 0
+
+
+def _hidden_bridge_priority(place1: str, dist1: Any, place2: str, dist2: Any) -> int:
+    d1 = int(dist1) if str(dist1).isdigit() else 0
+    d2 = int(dist2) if str(dist2).isdigit() else 0
+    if not place1 or not place2 or d1 <= 0 or d2 <= 0:
+        return 0
+    if place1 == place2:
+        if d1 == d2:
+            return 3
+        if place1 == "大井" and _ooi_track_side(d1) != _ooi_track_side(d2):
+            return 0
+        return 2
+    if d1 == d2:
+        return 1
+    return 0
+
+
+def _entry_rank_priority(entry: Dict[str, Any]) -> int:
+    """順位化用の信頼度。小さいほど強い条件。"""
+    bridge_priority = int(entry.get("bridge_priority") or 0)
+    if bridge_priority:
+        return 4 - bridge_priority
+    direct_priority = int(entry.get("direct_priority") or 0)
+    if direct_priority:
+        return 4 - direct_priority
+    if entry.get("is_strict"):
+        return 1
+    return 4
 
 
 def compute_pairwise_results(
@@ -898,16 +978,18 @@ def compute_pairwise_results(
 
             direct = advantage_entries_from_edge(G, u, v)
             if direct:
-                same_cond, other = [], []
+                priority_entries = []
                 for hi in direct:
                     place = hi.get("place", "")
                     dist = hi.get("dist", "")
-                    if is_one_turn(target_course, cur_dist) and not is_one_turn(place, dist):
+                    priority = _direct_race_priority(place, dist, target_course, target_distance)
+                    if not priority:
                         continue
                     dist_int = int(dist) if str(dist).isdigit() else 0
-                    entry = {
+                    rank = min(_safe_rank(hi.get("self_rank")), _safe_rank(hi.get("opp_rank")))
+                    priority_entries.append({
                         "diff": hi["diff"],
-                        "is_strict": place == target_course and dist_int == cur_dist,
+                        "is_strict": priority == 3,
                         "place": place,
                         "dist": dist,
                         "water": hi.get("water"),
@@ -916,65 +998,83 @@ def compute_pairwise_results(
                         "url": hi.get("url", ""),
                         "title": hi.get("title", ""),
                         "route": "direct",
+                        "rank": rank,
+                        "direct_priority": priority,
                         "self_rank": hi.get("self_rank", ""),
                         "self_umaban": hi.get("self_umaban", ""),
                         "opp_rank": hi.get("opp_rank", ""),
                         "opp_umaban": hi.get("opp_umaban", ""),
-                    }
-                    (same_cond if entry["is_strict"] else other).append(entry)
-                pair_net[u][v].extend(same_cond if same_cond else other)
+                    })
+
+                if priority_entries:
+                    best_priority = max(e["direct_priority"] for e in priority_entries)
+                    target_direct = [e for e in priority_entries if e["direct_priority"] == best_priority]
+                    target_direct.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
+                    pair_net[u][v].append(target_direct[0])
                 if pair_net[u][v]:
                     continue
 
-            candidates = []
+            candidates: List[Dict[str, Any]] = []
             for h in hidden_nodes:
                 u_h = advantage_entries_from_edge(G, u, h)
                 h_v = advantage_entries_from_edge(G, h, v)
                 if not u_h or not h_v:
                     continue
-                strict_vals = []
-                loose_vals = []
+                bridge_diffs = []
                 for uh in u_h:
                     for hv in h_v:
                         p1, d1 = uh.get("place", ""), uh.get("dist", "")
                         p2, d2 = hv.get("place", ""), hv.get("dist", "")
-                        if p1 == "大井" and p2 == "大井":
-                            if (is_ooi_inner(d1) and is_ooi_outer(d2)) or (is_ooi_outer(d1) and is_ooi_inner(d2)):
-                                continue
-                        if is_one_turn(target_course, cur_dist):
-                            if not is_one_turn(p1, d1) or not is_one_turn(p2, d2):
-                                continue
+                        bridge_priority = _hidden_bridge_priority(p1, d1, p2, d2)
+                        if not bridge_priority:
+                            continue
 
                         est = uh["diff"] + hv["diff"]
                         dt = min(_entry_sort_date(uh), _entry_sort_date(hv))
-                        is_strict = p1 == p2 and is_same_track_layout(p1, d1, d2) and p1 == target_course and str(d1) == str(cur_dist)
-                        item = (est, dt, p1, d1, h, uh, hv)
-                        (strict_vals if is_strict else loose_vals).append(item)
+                        is_current_same = (
+                            p1 == target_course
+                            and p2 == target_course
+                            and str(d1) == str(cur_dist)
+                            and str(d2) == str(cur_dist)
+                        )
+                        bridge_rank = min(_safe_rank(uh.get("self_rank")), _safe_rank(hv.get("opp_rank")))
+                        bridge_diffs.append((bridge_priority, est, p1, d1, dt, is_current_same, bridge_rank, uh, hv))
 
-                src = strict_vals or loose_vals
-                if not src:
+                if not bridge_diffs:
                     continue
-                raw = sum(x[0] for x in src) / len(src)
-                best = max(src, key=lambda x: x[1])
-                is_strict = bool(strict_vals)
+                best_priority = max(x[0] for x in bridge_diffs)
+                target_diffs = [x for x in bridge_diffs if x[0] == best_priority]
+                target_diffs.sort(key=lambda x: _rank_sort_key(x[6], x[4]))
+                best = target_diffs[0]
+                discount = 0.7 if best[5] else (0.35 if best_priority == 1 else 0.5)
                 candidates.append({
-                    "diff": raw * (0.7 if is_strict else 0.5),
-                    "is_strict": is_strict,
+                    "diff": best[1] * discount,
+                    "is_strict": best[5],
                     "place": best[2],
                     "dist": best[3],
-                    "water": best[5].get("water"),
-                    "date": best[1],
-                    "date_str": best[5].get("date_str", ""),
-                    "url": best[5].get("url", ""),
-                    "title": best[5].get("title", ""),
+                    "water": best[7].get("water"),
+                    "date": best[4],
+                    "date_str": best[7].get("date_str", ""),
+                    "url": best[7].get("url", ""),
+                    "title": best[7].get("title", ""),
                     "route": f"hidden:{h}",
                     "via_horse": h,
-                    "via_leg1": dict(best[5]),
-                    "via_leg2": dict(best[6]),
+                    "via_leg1": dict(best[7]),
+                    "via_leg2": dict(best[8]),
+                    "bridge_priority": best_priority,
+                    "rank": best[6],
                 })
 
             if candidates:
-                candidates.sort(key=lambda x: (x["is_strict"], abs(x["diff"]), x["date"]), reverse=True)
+                candidates.sort(
+                    key=lambda x: (
+                        int(x.get("bridge_priority", 0)),
+                        -_safe_rank(x.get("rank")),
+                        _entry_sort_date(x),
+                        abs(x.get("diff", 0.0)),
+                    ),
+                    reverse=True,
+                )
                 pair_net[u][v].append(candidates[0])
 
     return pair_net
@@ -1002,51 +1102,97 @@ def compute_matchup_matrix(
             if not entries:
                 continue
 
+            best_bridge_priority = max((int(e.get("bridge_priority") or 0) for e in entries), default=0)
+            if best_bridge_priority:
+                entries = [e for e in entries if int(e.get("bridge_priority") or 0) == best_bridge_priority]
+
             best_is_strict = any(e.get("is_strict") for e in entries)
             target_entries = [e for e in entries if bool(e.get("is_strict")) == best_is_strict]
-            target_entries.sort(key=_entry_sort_date, reverse=True)
-            target_entries = target_entries[:3]
+            target_entries.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
+            target_entries = target_entries[:1] if best_bridge_priority else target_entries[:3]
             draw_th, strong_th = thresholds(is_banei, best_is_strict)
+
+            is_forgiven_u = False
+            is_forgiven_v = False
+            cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
+            if target_course == "大井" and is_ooi_outer(cur_dist):
+                for e in target_entries:
+                    if e.get("place") == "大井" and is_ooi_inner(e.get("dist")):
+                        if e.get("diff", 0.0) < 0:
+                            is_forgiven_u = True
+                        if -e.get("diff", 0.0) < 0:
+                            is_forgiven_v = True
 
             if best_is_strict and len(target_entries) >= 2:
                 has_win = any(e["diff"] >= draw_th for e in target_entries)
                 has_loss = any(e["diff"] <= -draw_th for e in target_entries)
                 if has_win and has_loss:
                     matchup_matrix[u][v] = matchup_matrix[v][u] = "="
+                    rank_priority = min(_entry_rank_priority(e) for e in target_entries)
+                    for e in target_entries:
+                        e["matchup_rank_priority"] = rank_priority
                     continue
 
-            weighted_sum = 0.0
-            total_weight = 0.0
-            wins = losses = 0
-            for k, e in enumerate(target_entries):
-                base_w = 1.0 if k == 0 else 0.85 if k == 1 else 0.65
-                dt = e.get("date")
-                days = (now - dt).days if isinstance(dt, datetime) and dt != datetime.min else 180
-                months = max(0.0, days / 30.0)
-                if e.get("is_strict"):
-                    time_w = 1.0 if months <= 3 else 0.65 if months <= 6 else 0.35
-                else:
-                    time_w = 1.0 if months <= 2 else 0.8 if months <= 3 else 0.55 if months <= 6 else 0.3
-                w = base_w * time_w
-                d = e["diff"]
-                if d >= draw_th:
-                    wins += 1
-                elif d <= -draw_th:
-                    losses += 1
-                weighted_sum += d * w
-                total_weight += w
+            def get_sym(entries_for_calc: List[Dict[str, Any]], sign: float = 1.0) -> str:
+                if not entries_for_calc:
+                    return "="
+                weighted_sum = 0.0
+                total_weight = 0.0
+                wins = losses = 0
+                for k, e in enumerate(entries_for_calc):
+                    base_w = 1.0 if k == 0 else 0.9 if k == 1 else 0.7
+                    dt = _entry_sort_date(e)
+                    days = (now - dt).days if dt != datetime.min else 180
+                    months = max(0.0, days / 30.0)
+                    if best_is_strict:
+                        time_w = 1.0 if months <= 3 else 0.6 if months <= 6 else 0.3
+                    else:
+                        time_w = 1.0 if months <= 2 else 0.8 if months <= 3 else 0.6 if months <= 6 else 0.3
+                    w = base_w * time_w
+                    d = e["diff"] * sign
+                    if d >= draw_th:
+                        wins += 1
+                    elif d <= -draw_th:
+                        losses += 1
+                    weighted_sum += d * w
+                    total_weight += w
 
-            avg = weighted_sum / total_weight if total_weight else 0.0
-            if wins == len(target_entries) and wins > 0:
-                sym = ">>" if avg >= strong_th else ">"
-            elif losses == len(target_entries) and losses > 0:
-                sym = "<<" if avg <= -strong_th else "<"
-            elif avg >= draw_th:
-                sym = ">>" if avg >= strong_th else ">"
-            elif avg <= -draw_th:
-                sym = "<<" if avg <= -strong_th else "<"
+                avg = weighted_sum / total_weight if total_weight else 0.0
+                if wins == len(entries_for_calc) and wins > 0:
+                    return ">>" if avg >= strong_th else ">"
+                if losses == len(entries_for_calc) and losses > 0:
+                    return "<<" if avg <= -strong_th else "<"
+                if avg >= draw_th:
+                    return ">>" if avg >= strong_th else ">"
+                if avg <= -draw_th:
+                    return "<<" if avg <= -strong_th else "<"
+                return "="
+
+            sym_all_u = get_sym(target_entries, sign=1.0)
+            sorted_for_u = sorted(target_entries, key=lambda e: e["diff"], reverse=True)
+            sym_best2_u = get_sym(sorted_for_u[:2], sign=1.0)
+            sorted_for_v = sorted(target_entries, key=lambda e: e["diff"])
+            sym_best2_v = get_sym(sorted_for_v[:2], sign=-1.0)
+
+            rescue_u = sym_all_u in ("<", "<<") and sym_best2_u in (">", ">>")
+            sym_all_v = inverse_sym(sym_all_u)
+            rescue_v = sym_all_v in ("<", "<<") and sym_best2_v in (">", ">>")
+
+            if rescue_u:
+                sym = sym_best2_u
+            elif rescue_v:
+                sym = inverse_sym(sym_best2_v)
             else:
+                sym = sym_all_u
+
+            if is_forgiven_u and sym in ("<", "<<"):
                 sym = "="
+            if is_forgiven_v and sym in (">", ">>"):
+                sym = "="
+
+            rank_priority = min(_entry_rank_priority(e) for e in target_entries)
+            for e in target_entries:
+                e["matchup_rank_priority"] = rank_priority
 
             matchup_matrix[u][v] = sym
             matchup_matrix[v][u] = inverse_sym(sym)
@@ -1060,64 +1206,95 @@ def evaluate_and_rank(
     umaban_dict: Dict[str, str],
 ) -> Tuple[Dict[str, str], List[Tuple[str, int]], List[str]]:
     runners = list(umaban_dict.keys())
+    comparable_horses = set()
+    for u in runners:
+        for v in runners:
+            if u != v and pair_net.get(u, {}).get(v):
+                comparable_horses.add(u)
+                comparable_horses.add(v)
+
+    unranked = [u for u in runners if u not in comparable_horses]
+    if not comparable_horses:
+        return {}, [], unranked
+
+    pool = sorted(comparable_horses, key=lambda h: int(umaban_dict.get(h, 99)) if str(umaban_dict.get(h, "")).isdigit() else 99)
     D = nx.DiGraph()
-    D.add_nodes_from(runners)
+    D.add_nodes_from(pool)
+
+    def matchup_priority(a: str, b: str) -> int:
+        candidates = pair_net.get(a, {}).get(b, []) + pair_net.get(b, {}).get(a, [])
+        priorities = [int(e.get("matchup_rank_priority", _entry_rank_priority(e))) for e in candidates]
+        return min(priorities) if priorities else 99
 
     for i, u in enumerate(runners):
         for v in runners[i + 1:]:
             rel = matchup_matrix.get(u, {}).get(v, "")
             if rel in ("", "="):
                 continue
-            entries = pair_net.get(u, {}).get(v, []) or pair_net.get(v, {}).get(u, [])
-            is_direct = any(e.get("route") == "direct" for e in entries)
-            strength = 2 if rel in (">>", "<<") else 1
             winner, loser = (u, v) if rel in (">", ">>") else (v, u)
-            D.add_edge(winner, loser, strength=strength, is_direct=is_direct)
+            D.add_edge(winner, loser, rank_priority=matchup_priority(u, v))
 
-    connected = {n for n in runners if D.in_degree(n) + D.out_degree(n) > 0}
-    unranked = [u for u in runners if u not in connected]
-    if not connected:
-        return {}, [], unranked
+    def prioritize_strong_conditions_in_cycles(graph: nx.DiGraph) -> nx.DiGraph:
+        adjusted = graph.copy()
+        changed = True
+        while changed:
+            changed = False
+            for horses in list(nx.strongly_connected_components(adjusted)):
+                if len(horses) < 3:
+                    continue
+                internal_edges = [
+                    (a, b, adjusted[a][b])
+                    for a, b in adjusted.edges()
+                    if a in horses and b in horses
+                ]
+                if not internal_edges:
+                    continue
+                best_priority = min(data.get("rank_priority", 99) for _, _, data in internal_edges)
+                for a, b, data in internal_edges:
+                    if data.get("rank_priority", 99) > best_priority:
+                        adjusted.remove_edge(a, b)
+                        changed = True
+        return adjusted
 
-    subD = D.subgraph(connected).copy()
-    sccs = list(nx.strongly_connected_components(subD))
-    comp_index: Dict[str, int] = {}
-    for idx, comp in enumerate(sccs):
-        for node in comp:
-            comp_index[node] = idx
-
+    D = prioritize_strong_conditions_in_cycles(D)
+    sccs = list(nx.strongly_connected_components(D))
+    comp_index = {h: idx for idx, comp in enumerate(sccs) for h in comp}
     C = nx.DiGraph()
-    for idx, comp in enumerate(sccs):
-        C.add_node(idx, members=set(comp))
-    for a, b, ed in subD.edges(data=True):
-        ca, cb = comp_index[a], comp_index[b]
-        if ca != cb:
-            weight = (2 if ed.get("is_direct") else 1) * 10 + ed.get("strength", 1)
-            if not C.has_edge(ca, cb) or weight > C[ca][cb].get("weight", 0):
-                C.add_edge(ca, cb, weight=weight)
+    for idx in range(len(sccs)):
+        C.add_node(idx)
+    for winner, loser in D.edges():
+        wi, li = comp_index[winner], comp_index[loser]
+        if wi != li:
+            C.add_edge(wi, li)
 
-    depth: Dict[int, int] = {}
-    for comp in nx.topological_sort(C):
-        preds = list(C.predecessors(comp))
-        depth[comp] = 0 if not preds else max(depth[p] + 1 for p in preds)
+    level_by_comp = {idx: 0 for idx in C.nodes()}
+    for idx in nx.topological_sort(C):
+        for loser_idx in C.successors(idx):
+            level_by_comp[loser_idx] = max(level_by_comp[loser_idx], level_by_comp[idx] + 1)
 
-    def depth_to_tier(d: int) -> str:
-        return "S" if d <= 0 else "A" if d == 1 else "B" if d == 2 else "C"
+    tier_by_level = {0: "S", 1: "A", 2: "B"}
 
     tier_base = {"S": 400000, "A": 300000, "B": 200000, "C": 100000}
-    descendants_cache = {c: nx.descendants(C, c) for c in C.nodes()}
     tier_map: Dict[str, str] = {}
     ranked: List[Tuple[str, int]] = []
 
-    for u in runners:
+    for u in pool:
         if u in unranked:
             continue
-        c = comp_index[u]
-        tier = depth_to_tier(depth.get(c, 0))
+        comp = comp_index[u]
+        tier = tier_by_level.get(level_by_comp.get(comp, 0), "C")
         tier_map[u] = tier
-        direct_down = sum(1 for _, _, ed in subD.out_edges(u, data=True) if ed.get("is_direct"))
-        all_down = sum(len(C.nodes[x].get("members", [])) for x in descendants_cache.get(c, set()))
-        strong_down = sum(1 for _, _, ed in subD.out_edges(u, data=True) if ed.get("strength", 1) >= 2)
+        direct_down = 0
+        strong_down = 0
+        for _, loser in D.out_edges(u):
+            entries = pair_net.get(u, {}).get(loser, []) + pair_net.get(loser, {}).get(u, [])
+            if any(e.get("route") == "direct" for e in entries):
+                direct_down += 1
+            rel = matchup_matrix.get(u, {}).get(loser)
+            if rel in (">>", "<<"):
+                strong_down += 1
+        downstream_comps = nx.descendants(C, comp)
+        all_down = sum(len(sccs[c]) for c in downstream_comps)
         try:
             uma_no = int(umaban_dict.get(u, "999"))
         except Exception:
@@ -1481,8 +1658,10 @@ with st.expander("この版の修正点", expanded=False):
         """
 - データ元は引き続き NAR公式の `DebaTable` と `RaceMarkTable` だけです。
 - 成績表はヘッダから `着順`・`馬番`・`タイム` 列を特定して読みます。行全体から `54.0` のような数字を拾わないため、斤量誤認を避けます。
-- 直接対決を最優先し、同条件の直接対決がある場合は同条件だけで判定します。
-- 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、条件違い経由は0.5倍に割引します。
+- ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度と循環整理から S/A/B/C を決めます。
+- 直接対決を最優先し、同場同距離 → 同場 → 同距離の順で最も強い材料を採用します。
+- 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場経由は0.5倍、同距離経由は0.35倍に割引します。
+- 比較が三すくみになった場合は、より信頼度の高い条件の矢印を残して弱い条件の矢印を外してからランク化します。
 - ばんえいは水分量 `2.0%未満` / `2.0%以上` で比較対象を絞れます。不等号は `5秒 / 15秒` 閾値です。
         """
     )
