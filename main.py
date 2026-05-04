@@ -12,7 +12,8 @@ NAR公式サイト専用 物差し能力比較 Streamlit 完全版
       これにより、斤量を着順・タイムと誤認する事故を避ける。
     - 隠れ馬経由の比較では、優先度2「同競馬場・距離違い」の中で今回の競馬場を優先する。
     - ばんえいの水分量フィルタは該当水分量を最優先する。
-      該当材料がない組み合わせだけ水分違いレースを参考採用し、15秒以上でのみ >/< を出す。
+      水分違いレースは最後の参考材料としてだけ使い、15秒以上でのみ >/< を出す。
+      通常材料でランク付けできる馬には、水分違い材料をランクへ混ぜない。
 
 起動:
     pip install streamlit requests beautifulsoup4 networkx
@@ -1248,16 +1249,28 @@ def evaluate_and_rank(
     umaban_dict: Dict[str, str],
 ) -> Tuple[Dict[str, str], List[Tuple[str, int]], List[str]]:
     runners = list(umaban_dict.keys())
-    comparable_horses = set()
+    normal_comparable_horses = set()
+    water_only_comparable_horses = set()
+
     for u in runners:
         for v in runners:
             if u == v or not pair_net.get(u, {}).get(v):
                 continue
             rel = matchup_matrix.get(u, {}).get(v, "")
             has_normal_material = any(not e.get("water_mismatch_reference") for e in pair_net.get(u, {}).get(v, []))
-            if has_normal_material or rel in (">", ">>", "<", "<<"):
-                comparable_horses.add(u)
-                comparable_horses.add(v)
+            if has_normal_material:
+                normal_comparable_horses.add(u)
+                normal_comparable_horses.add(v)
+            elif rel in (">", ">>", "<", "<<"):
+                water_only_comparable_horses.add(u)
+                water_only_comparable_horses.add(v)
+
+    # 水分違いは最終手段。通常材料がある馬のランクには混ぜない。
+    water_only_comparable_horses = {
+        h for h in water_only_comparable_horses
+        if h not in normal_comparable_horses
+    }
+    comparable_horses = normal_comparable_horses | water_only_comparable_horses
 
     unranked = [u for u in runners if u not in comparable_horses]
     if not comparable_horses:
@@ -1276,6 +1289,12 @@ def evaluate_and_rank(
         for v in runners[i + 1:]:
             rel = matchup_matrix.get(u, {}).get(v, "")
             if rel in ("", "="):
+                continue
+            entries = pair_net.get(u, {}).get(v, []) + pair_net.get(v, {}).get(u, [])
+            is_water_only_edge = bool(entries) and all(e.get("water_mismatch_reference") for e in entries)
+            if is_water_only_edge and (u in normal_comparable_horses or v in normal_comparable_horses):
+                continue
+            if u not in pool or v not in pool:
                 continue
             winner, loser = (u, v) if rel in (">", ">>") else (v, u)
             D.add_edge(winner, loser, rank_priority=matchup_priority(u, v))
@@ -1397,7 +1416,7 @@ def build_html_output(
     tier_names = {"S": "最上位", "A": "上位", "B": "中位", "C": "下位"}
     water_txt = f" / 水分量:{target_water:.1f}%" if target_water is not None else ""
     filter_txt = f" / 水分量フィルタ:{water_bucket_label(water_filter_bucket)}" if is_banei else ""
-    fallback_txt = " / 水分違いは該当材料なしの時だけ15秒以上で参考採用" if is_banei and water_filter_bucket else ""
+    fallback_txt = " / 水分違いは不足時のみ参考" if is_banei and water_filter_bucket else ""
     parts = ["<div class='relative-root'>"]
     parts.append(
         f"<div class='condition-box'>対象条件：<b>{html.escape(target_course)}{html.escape(str(target_distance))}</b>"
@@ -1409,11 +1428,11 @@ def build_html_output(
         sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")), is_water_ref)
         badge = "同条件" if e.get("is_strict") else f"{e.get('place','?')}{e.get('dist','?')}"
         if is_water_ref:
-            badge += "・水分違い参考"
+            badge = "参考"
         water = e.get("water")
         wtxt = f"水分:{water:.1f}%" if isinstance(water, (int, float)) else ""
         if is_water_ref:
-            wtxt = f"{wtxt} / 15秒以上のみ判定".strip()
+            wtxt = f"{wtxt} / 水分違い・大差のみ".strip()
         v_uma = umaban_dict.get(v, "?")
         if e.get("route") == "direct":
             race_link = _safe_link(e.get("url", ""), _race_link_label(e))
@@ -1421,8 +1440,9 @@ def build_html_output(
             self_umaban = e.get("self_umaban") or "?"
             opp_rank = e.get("opp_rank") or "?"
             opp_umaban = e.get("opp_umaban") or "?"
+            label_cls = "muted" if is_water_ref else "direct-label"
             route_html = (
-                f"<span class='direct-label'>直接</span> "
+                f"<span class='{label_cls}'>直接</span> "
                 f"<span class='muted'>当時: 本馬 {html.escape(str(self_rank))}着/{html.escape(str(self_umaban))}番 "
                 f"vs 相手 {html.escape(str(opp_rank))}着/{html.escape(str(opp_umaban))}番</span> {race_link}"
             )
@@ -1430,15 +1450,18 @@ def build_html_output(
             via = e.get("via_horse") or str(e.get("route", "")).replace("hidden:", "")
             leg1 = e.get("via_leg1", {}) or {}
             leg2 = e.get("via_leg2", {}) or {}
+            label_cls = "muted" if is_water_ref else "via-label"
             route_html = (
-                f"<span class='via-label'>経由：{html.escape(str(via))}</span> "
+                f"<span class='{label_cls}'>経由：{html.escape(str(via))}</span> "
                 f"<span class='muted'>本馬↔経由馬:</span> {_safe_link(leg1.get('url',''), _race_link_label(leg1))} "
                 f"<span class='muted'>/ 経由馬↔相手:</span> {_safe_link(leg2.get('url',''), _race_link_label(leg2))}"
             )
+        line_cls = "comparison-line water-reference-line" if is_water_ref else "comparison-line"
+        weight = "650" if is_water_ref else "800"
         return (
-            f"<div class='comparison-line'>"
+            f"<div class='{line_cls}'>"
             f"<span class='badge'>{html.escape(badge)}</span> <span class='muted'>{html.escape(wtxt)}</span> "
-            f"本馬 <span style='color:{c};font-weight:800;'>{sym}</span> [{html.escape(v_uma)}]{html.escape(v)} "
+            f"本馬 <span style='color:{c};font-weight:{weight};'>{sym}</span> [{html.escape(v_uma)}]{html.escape(v)} "
             f"<span style='color:{c};'>({e.get('diff',0.0):+.1f}秒換算)</span><br>"
             f"<span class='route-line'>{route_html}</span></div>"
         )
@@ -1541,7 +1564,11 @@ def build_group_direct_html(past_races: List[RaceInfo], umaban_dict: Dict[str, s
     return "\n".join(out)
 
 
-def build_matrix_html(matchup_matrix: Dict[str, Dict[str, str]], umaban_dict: Dict[str, str]) -> str:
+def build_matrix_html(
+    matchup_matrix: Dict[str, Dict[str, str]],
+    umaban_dict: Dict[str, str],
+    pair_net: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
+) -> str:
     runners = list(umaban_dict.keys())
     ths = "".join(f"<th>[{html.escape(umaban_dict.get(h,'?'))}]<br>{html.escape(h)}</th>" for h in runners)
     rows = []
@@ -1552,7 +1579,12 @@ def build_matrix_html(matchup_matrix: Dict[str, Dict[str, str]], umaban_dict: Di
                 tds.append("<td class='self-cell'>-</td>")
             else:
                 rel = matchup_matrix.get(u, {}).get(v, "")
+                entries = pair_net.get(u, {}).get(v, []) if pair_net else []
+                is_water_ref = bool(entries) and all(e.get("water_mismatch_reference") for e in entries)
                 cls = "green" if rel in (">", ">>") else "red" if rel in ("<", "<<") else "muted"
+                if is_water_ref:
+                    cls = "muted water-matrix-ref"
+                    rel = f"({rel})" if rel else ""
                 tds.append(f"<td class='{cls}' style='text-align:center;font-weight:800;'>{html.escape(rel or ' ')}</td>")
         rows.append("<tr>" + "".join(tds) + "</tr>")
     return f"<div class='matrix-wrap'><table class='matrix-table'><thead><tr><th></th>{ths}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
@@ -1604,7 +1636,7 @@ def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket
             current.is_banei,
         )
         group_direct_html = build_group_direct_html(past_races, current.umaban_dict)
-        matrix_html = build_matrix_html(matchup_matrix, current.umaban_dict)
+        matrix_html = build_matrix_html(matchup_matrix, current.umaban_dict, pair_net)
         direct_edges, hidden_edges = count_edges(G)
         current.debug.update({
             "past_races_after_filter": len(past_races),
@@ -1632,6 +1664,10 @@ body { font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",
 .horse-title { font-size:1.08em; font-weight:800; color:#17202a; }
 .summary-line { font-size:.86em; margin:4px 0 8px 0; }
 .comparison-line { margin-left:10px; font-size:.86em; line-height:1.75; margin-bottom:5px; }
+.water-reference-line { font-size:.74em; line-height:1.55; margin-left:18px; margin-bottom:3px; color:#6f7b86; opacity:.72; }
+.water-reference-line .badge { background:#f4f6f8; color:#7d8790; font-weight:500; padding:0 5px; }
+.water-reference-line .route-line { margin-left:8px; }
+.water-reference-line a { color:#66788a; }
 .route-line { margin-left:14px; }
 .badge { display:inline-block; background:#eef3f8; border-radius:999px; padding:1px 7px; margin-right:4px; }
 .direct-label { color:#0b65c2; font-weight:800; }
@@ -1650,6 +1686,7 @@ body { font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",
 .matrix-wrap { overflow:auto; }
 .matrix-table th { min-width:68px; }
 .self-cell { background:#f0f0f0; color:#777; text-align:center; }
+.water-matrix-ref { font-size:.82em; font-weight:500 !important; opacity:.68; }
 a { color:#0b65c2; text-decoration:none; }
 a:hover { text-decoration:underline; }
 </style>
@@ -1721,7 +1758,7 @@ with st.expander("この版の修正点", expanded=False):
 - 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場経由は0.5倍、同距離経由は0.35倍に割引します。
 - 隠れ馬経由の優先度2「同競馬場・距離違い」では、その中でも今回の競馬場を優先します。
 - 比較が三すくみになった場合は、より信頼度の高い条件の矢印を残して弱い条件の矢印を外してからランク化します。
-- ばんえいは該当水分量を最優先します。該当材料がない組み合わせだけ水分違いを参考採用し、15秒以上でのみ `>` / `<` を出します。
+- ばんえいは該当水分量を最優先します。水分違いは小さく参考表示し、通常材料でランク付けできる馬には混ぜません。
         """
     )
 
