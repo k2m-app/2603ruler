@@ -6,11 +6,13 @@ NAR公式サイト専用 物差し能力比較 Streamlit 完全版
     出馬表  : https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable
     成績表  : https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/RaceMarkTable
 
-重要:
+    重要:
     - netkeiba / 南関東公式 / keibabook からは相対比較データを取得しない。
     - 成績表のタイムは「タイム」列から読む。行全体から 54.0 などを拾わない。
       これにより、斤量を着順・タイムと誤認する事故を避ける。
     - 隠れ馬経由の比較では、優先度2「同競馬場・距離違い」の中で今回の競馬場を優先する。
+    - ばんえいの水分量フィルタは該当水分量を最優先する。
+      該当材料がない組み合わせだけ水分違いレースを参考採用し、15秒以上でのみ >/< を出す。
 
 起動:
     pip install streamlit requests beautifulsoup4 networkx
@@ -698,18 +700,11 @@ class NarOfficialScraper:
     def fetch_current_and_past(self, deba_url: str, water_filter_bucket: Optional[str]) -> Tuple[CurrentRaceData, List[RaceInfo]]:
         current = self.parse_current_deba(deba_url)
         race_by_url: Dict[str, RaceInfo] = {}
-        excluded_by_water: List[str] = []
+        matched_by_water: List[str] = []
+        reference_by_water: List[str] = []
         failed_results: List[str] = []
 
         for pl in current.past_links:
-            if current.is_banei and water_filter_bucket:
-                hb = water_bucket(pl.water_hint)
-                if hb is not None and hb != water_filter_bucket:
-                    excluded_by_water.append(
-                        f"{pl.race_date} {pl.current_horse} 水分量={pl.water_hint}({water_bucket_label(hb)})"
-                    )
-                    continue
-
             try:
                 race = self.parse_result_table(pl.url, hint=pl)
             except Exception as e:
@@ -722,11 +717,14 @@ class NarOfficialScraper:
 
             if current.is_banei and water_filter_bucket:
                 rb = water_bucket(race.water)
-                if rb != water_filter_bucket:
-                    excluded_by_water.append(
+                if rb == water_filter_bucket:
+                    matched_by_water.append(
                         f"{race.race_date} {race.title} 水分量={race.water}({water_bucket_label(rb)})"
                     )
-                    continue
+                else:
+                    reference_by_water.append(
+                        f"{race.race_date} {race.title} 水分量={race.water}({water_bucket_label(rb)})"
+                    )
 
             race_by_url.setdefault(pl.url, race)
             if pl.current_horse not in race_by_url[pl.url].source_current_horses:
@@ -737,8 +735,10 @@ class NarOfficialScraper:
             "past_result_fetch_failed": len(failed_results),
             "failed_results_sample": failed_results[:20],
             "water_filter": water_bucket_label(water_filter_bucket),
-            "excluded_by_water": len(excluded_by_water),
-            "excluded_by_water_sample": excluded_by_water[:20],
+            "matched_by_water": len(matched_by_water),
+            "matched_by_water_sample": matched_by_water[:20],
+            "reference_by_water": len(reference_by_water),
+            "reference_by_water_sample": reference_by_water[:20],
         })
         return current, list(race_by_url.values())
 
@@ -747,8 +747,10 @@ class NarOfficialScraper:
 # 4. 比較グラフ
 # ==========================================
 
-def thresholds(is_banei: bool, is_strict: bool) -> Tuple[float, float]:
+def thresholds(is_banei: bool, is_strict: bool, is_water_mismatch_reference: bool = False) -> Tuple[float, float]:
     if is_banei:
+        if is_water_mismatch_reference:
+            return 15.0, float("inf")
         return 5.0, 15.0
     return (0.55, 1.05) if is_strict else (0.75, 1.25)
 
@@ -766,6 +768,7 @@ def build_comparison_graph(
     target_distance: str,
     umaban_dict: Dict[str, str],
     is_banei: bool,
+    water_filter_bucket: Optional[str] = None,
 ) -> nx.DiGraph:
     runners = list(umaban_dict.keys())
     current_names = set(runners)
@@ -788,6 +791,9 @@ def build_comparison_graph(
         is_exact = is_same_place and r_dist == cur_dist
         is_same_layout = is_same_track_layout(race.course, race.distance, target_distance)
         badge = "[同場同距]" if is_exact else "[同場]" if is_same_place else "[同距]" if r_dist == cur_dist else ""
+        water_bucket_value = water_bucket(race.water)
+        water_filter_applied = is_banei and water_filter_bucket is not None
+        water_mismatch_reference = bool(water_filter_applied and water_bucket_value != water_filter_bucket)
 
         history = {
             "date": parse_date_any(race.race_date),
@@ -795,6 +801,9 @@ def build_comparison_graph(
             "place": race.course,
             "dist": race.distance,
             "water": race.water,
+            "water_bucket": water_bucket_value,
+            "water_filter_bucket": water_filter_bucket,
+            "water_mismatch_reference": water_mismatch_reference,
             "raw_diff": capped,
             "badge": badge,
             "url": race.url,
@@ -851,7 +860,10 @@ def build_comparison_graph(
         seen = set()
         deduped = []
         for hi in d["history"]:
-            key = (hi.get("place", ""), hi.get("dist", ""))
+            if is_banei and water_filter_bucket is not None:
+                key = (hi.get("place", ""), hi.get("dist", ""), hi.get("water_bucket"))
+            else:
+                key = (hi.get("place", ""), hi.get("dist", ""))
             if key in seen:
                 continue
             seen.add(key)
@@ -949,6 +961,8 @@ def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place
 
 def _entry_rank_priority(entry: Dict[str, Any]) -> int:
     """順位化用の信頼度。小さいほど強い条件。"""
+    if entry.get("water_mismatch_reference"):
+        return 5
     bridge_priority = int(entry.get("bridge_priority") or 0)
     if bridge_priority:
         return 4 - bridge_priority
@@ -993,6 +1007,9 @@ def compute_pairwise_results(
                         "place": place,
                         "dist": dist,
                         "water": hi.get("water"),
+                        "water_bucket": hi.get("water_bucket"),
+                        "water_filter_bucket": hi.get("water_filter_bucket"),
+                        "water_mismatch_reference": bool(hi.get("water_mismatch_reference")),
                         "date": hi.get("date", datetime.min),
                         "date_str": hi.get("date_str", ""),
                         "url": hi.get("url", ""),
@@ -1007,8 +1024,10 @@ def compute_pairwise_results(
                     })
 
                 if priority_entries:
-                    best_priority = max(e["direct_priority"] for e in priority_entries)
-                    target_direct = [e for e in priority_entries if e["direct_priority"] == best_priority]
+                    water_matched_entries = [e for e in priority_entries if not e.get("water_mismatch_reference")]
+                    target_pool = water_matched_entries or priority_entries
+                    best_priority = max(e["direct_priority"] for e in target_pool)
+                    target_direct = [e for e in target_pool if e["direct_priority"] == best_priority]
                     target_direct.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
                     pair_net[u][v].append(target_direct[0])
                 if pair_net[u][v]:
@@ -1021,7 +1040,7 @@ def compute_pairwise_results(
                 if not u_h or not h_v:
                     continue
 
-                bridge_diffs: List[Tuple[int, int, float, str, Any, datetime, bool, int, Dict[str, Any], Dict[str, Any]]] = []
+                bridge_diffs: List[Tuple[int, int, float, str, Any, datetime, bool, int, Dict[str, Any], Dict[str, Any], bool]] = []
                 for uh in u_h:
                     for hv in h_v:
                         p1, d1 = uh.get("place", ""), uh.get("dist", "")
@@ -1040,13 +1059,18 @@ def compute_pairwise_results(
                             and str(d2) == str(cur_dist)
                         )
                         bridge_rank = min(_safe_rank(uh.get("self_rank")), _safe_rank(hv.get("opp_rank")))
-                        bridge_diffs.append((bridge_priority, course_bonus, est, p1, d1, dt, is_current_same, bridge_rank, uh, hv))
+                        water_mismatch_reference = bool(
+                            uh.get("water_mismatch_reference") or hv.get("water_mismatch_reference")
+                        )
+                        bridge_diffs.append((bridge_priority, course_bonus, est, p1, d1, dt, is_current_same, bridge_rank, uh, hv, water_mismatch_reference))
 
                 if not bridge_diffs:
                     continue
 
-                best_priority = max(x[0] for x in bridge_diffs)
-                target_diffs = [x for x in bridge_diffs if x[0] == best_priority]
+                water_matched_diffs = [x for x in bridge_diffs if not x[10]]
+                target_pool = water_matched_diffs or bridge_diffs
+                best_priority = max(x[0] for x in target_pool)
+                target_diffs = [x for x in target_pool if x[0] == best_priority]
                 if best_priority == 2:
                     best_course_bonus = max(x[1] for x in target_diffs)
                     target_diffs = [x for x in target_diffs if x[1] == best_course_bonus]
@@ -1070,12 +1094,16 @@ def compute_pairwise_results(
                     "via_leg2": dict(best[9]),
                     "bridge_priority": best_priority,
                     "bridge_current_course_bonus": best[1],
+                    "water_mismatch_reference": best[10],
+                    "water_bucket": best[8].get("water_bucket"),
+                    "water_filter_bucket": best[8].get("water_filter_bucket"),
                     "rank": best[7],
                 })
 
             if candidates:
                 candidates.sort(
                     key=lambda x: (
+                        int(not x.get("water_mismatch_reference")),
                         int(x.get("bridge_priority", 0)),
                         int(x.get("bridge_current_course_bonus", 0)),
                         -_safe_rank(x.get("rank")),
@@ -1115,11 +1143,16 @@ def compute_matchup_matrix(
             if best_bridge_priority:
                 entries = [e for e in entries if int(e.get("bridge_priority") or 0) == best_bridge_priority]
 
+            water_matched_entries = [e for e in entries if not e.get("water_mismatch_reference")]
+            if water_matched_entries:
+                entries = water_matched_entries
+
             best_is_strict = any(e.get("is_strict") for e in entries)
             target_entries = [e for e in entries if bool(e.get("is_strict")) == best_is_strict]
             target_entries.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
             target_entries = target_entries[:1] if best_bridge_priority else target_entries[:3]
-            draw_th, strong_th = thresholds(is_banei, best_is_strict)
+            is_water_mismatch_reference = any(e.get("water_mismatch_reference") for e in target_entries)
+            draw_th, strong_th = thresholds(is_banei, best_is_strict, is_water_mismatch_reference)
 
             is_forgiven_u = False
             is_forgiven_v = False
@@ -1218,7 +1251,11 @@ def evaluate_and_rank(
     comparable_horses = set()
     for u in runners:
         for v in runners:
-            if u != v and pair_net.get(u, {}).get(v):
+            if u == v or not pair_net.get(u, {}).get(v):
+                continue
+            rel = matchup_matrix.get(u, {}).get(v, "")
+            has_normal_material = any(not e.get("water_mismatch_reference") for e in pair_net.get(u, {}).get(v, []))
+            if has_normal_material or rel in (">", ">>", "<", "<<"):
                 comparable_horses.add(u)
                 comparable_horses.add(v)
 
@@ -1318,8 +1355,8 @@ def evaluate_and_rank(
 # 5. HTML出力
 # ==========================================
 
-def diff_symbol_and_color(adv: float, is_banei: bool, is_strict: bool) -> Tuple[str, str]:
-    draw_th, strong_th = thresholds(is_banei, is_strict)
+def diff_symbol_and_color(adv: float, is_banei: bool, is_strict: bool, is_water_mismatch_reference: bool = False) -> Tuple[str, str]:
+    draw_th, strong_th = thresholds(is_banei, is_strict, is_water_mismatch_reference)
     if abs(adv) < draw_th:
         return "＝", "#777"
     if adv > 0:
@@ -1360,17 +1397,23 @@ def build_html_output(
     tier_names = {"S": "最上位", "A": "上位", "B": "中位", "C": "下位"}
     water_txt = f" / 水分量:{target_water:.1f}%" if target_water is not None else ""
     filter_txt = f" / 水分量フィルタ:{water_bucket_label(water_filter_bucket)}" if is_banei else ""
+    fallback_txt = " / 水分違いは該当材料なしの時だけ15秒以上で参考採用" if is_banei and water_filter_bucket else ""
     parts = ["<div class='relative-root'>"]
     parts.append(
         f"<div class='condition-box'>対象条件：<b>{html.escape(target_course)}{html.escape(str(target_distance))}</b>"
-        f"{html.escape(water_txt)}{html.escape(filter_txt)} / 直接対決優先 / 物差し馬経由は割引</div>"
+        f"{html.escape(water_txt)}{html.escape(filter_txt)}{html.escape(fallback_txt)} / 直接対決優先 / 物差し馬経由は割引</div>"
     )
 
     def render_entry(u: str, v: str, e: Dict[str, Any]) -> str:
-        sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")))
+        is_water_ref = bool(e.get("water_mismatch_reference"))
+        sym, c = diff_symbol_and_color(e.get("diff", 0.0), is_banei, bool(e.get("is_strict")), is_water_ref)
         badge = "同条件" if e.get("is_strict") else f"{e.get('place','?')}{e.get('dist','?')}"
+        if is_water_ref:
+            badge += "・水分違い参考"
         water = e.get("water")
         wtxt = f"水分:{water:.1f}%" if isinstance(water, (int, float)) else ""
+        if is_water_ref:
+            wtxt = f"{wtxt} / 15秒以上のみ判定".strip()
         v_uma = umaban_dict.get(v, "?")
         if e.get("route") == "direct":
             race_link = _safe_link(e.get("url", ""), _race_link_label(e))
@@ -1535,7 +1578,14 @@ def analyze_race(scraper: NarOfficialScraper, deba_url: str, water_filter_bucket
         if not current.umaban_dict:
             return current.title, "データなし", "", "", current.debug
 
-        G = build_comparison_graph(past_races, current.target_course, current.target_distance, current.umaban_dict, current.is_banei)
+        G = build_comparison_graph(
+            past_races,
+            current.target_course,
+            current.target_distance,
+            current.umaban_dict,
+            current.is_banei,
+            water_filter_bucket,
+        )
         runners = list(current.umaban_dict.keys())
         pair_net = compute_pairwise_results(G, runners, current.target_course, current.target_distance, current.is_banei)
         matchup_matrix = compute_matchup_matrix(pair_net, runners, current.target_course, current.target_distance, current.is_banei)
@@ -1671,7 +1721,7 @@ with st.expander("この版の修正点", expanded=False):
 - 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場経由は0.5倍、同距離経由は0.35倍に割引します。
 - 隠れ馬経由の優先度2「同競馬場・距離違い」では、その中でも今回の競馬場を優先します。
 - 比較が三すくみになった場合は、より信頼度の高い条件の矢印を残して弱い条件の矢印を外してからランク化します。
-- ばんえいは水分量 `2.0%未満` / `2.0%以上` で比較対象を絞れます。不等号は `5秒 / 15秒` 閾値です。
+- ばんえいは該当水分量を最優先します。該当材料がない組み合わせだけ水分違いを参考採用し、15秒以上でのみ `>` / `<` を出します。
         """
     )
 
