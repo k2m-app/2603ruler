@@ -10,6 +10,7 @@ NAR公式サイト専用 物差し能力比較 Streamlit 完全版
     - netkeiba / 南関東公式 / keibabook からは相対比較データを取得しない。
     - 成績表のタイムは「タイム」列から読む。行全体から 54.0 などを拾わない。
       これにより、斤量を着順・タイムと誤認する事故を避ける。
+    - 隠れ馬経由の比較では、優先度2「同競馬場・距離違い」の中で今回の競馬場を優先する。
 
 起動:
     pip install streamlit requests beautifulsoup4 networkx
@@ -23,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import networkx as nx
@@ -95,7 +96,6 @@ def extract_water(text: str) -> Optional[float]:
     m = re.search(r"馬場\s*[:：]\s*(\d+(?:\.\d+)?)", s)
     if m:
         return _to_float(m.group(1))
-    # ばんえいの過去走欄: 26.04.20 0.8 8頭
     m = re.search(r"\d{2,4}[./]\d{1,2}[./]\d{1,2}\s+(\d+(?:\.\d+)?)\s+\d+頭", s)
     if m:
         return _to_float(m.group(1))
@@ -130,7 +130,6 @@ def parse_time_token(token: str) -> Optional[float]:
             mm, ss = t.split(":", 1)
             return int(mm) * 60 + float(ss)
         sec = float(t)
-        # ばんえいを含め、短距離でも40秒未満は競走タイムとして扱わない。
         return sec if 40.0 <= sec <= 400.0 else None
     except Exception:
         return None
@@ -616,8 +615,6 @@ class NarOfficialScraper:
                 return clean_text(cells[fallback_idx])
             return ""
 
-        # NAR成績表の一般形:
-        # 着順 / 枠番 / 馬番 / 馬名 / 性齢 / 負担重量 / 騎手 / タイム / ...
         rank = _rank_from_text(cell_text("rank", 0))
         umaban = cell_text("horse_no", 2)
         if not re.fullmatch(r"\d{1,2}", umaban):
@@ -626,8 +623,6 @@ class NarOfficialScraper:
         time_text = cell_text("time")
         sec = parse_time_token(time_text)
 
-        # ヘッダを取れなかった場合だけ、馬名セルより後ろの「m:ss」優先で保険。
-        # 小数単独は斤量と衝突しやすいので、ヘッダなしでは最後の手段に留める。
         if sec is None:
             name_idx = None
             for i, c in enumerate(cells):
@@ -787,7 +782,6 @@ def build_comparison_graph(
         if is_banei:
             capped = max(-30.0, min(30.0, raw_diff_seconds))
         else:
-            # keiba_bot.py の相対比較と同じく、極端な大敗差で序列が壊れないよう非対称に丸める。
             capped = max(-1.0, min(1.5, raw_diff_seconds))
         r_dist = int(race.distance) if str(race.distance).isdigit() else 0
         is_same_place = race.course == target_course
@@ -946,6 +940,13 @@ def _hidden_bridge_priority(place1: str, dist1: Any, place2: str, dist2: Any) ->
     return 0
 
 
+def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place2: str, target_course: str) -> int:
+    """優先度2「同競馬場・距離違い」の中では今回の競馬場を優先する。"""
+    if bridge_priority == 2 and place1 == place2 == target_course:
+        return 1
+    return 0
+
+
 def _entry_rank_priority(entry: Dict[str, Any]) -> int:
     """順位化用の信頼度。小さいほど強い条件。"""
     bridge_priority = int(entry.get("bridge_priority") or 0)
@@ -985,7 +986,6 @@ def compute_pairwise_results(
                     priority = _direct_race_priority(place, dist, target_course, target_distance)
                     if not priority:
                         continue
-                    dist_int = int(dist) if str(dist).isdigit() else 0
                     rank = min(_safe_rank(hi.get("self_rank")), _safe_rank(hi.get("opp_rank")))
                     priority_entries.append({
                         "diff": hi["diff"],
@@ -1020,7 +1020,8 @@ def compute_pairwise_results(
                 h_v = advantage_entries_from_edge(G, h, v)
                 if not u_h or not h_v:
                     continue
-                bridge_diffs = []
+
+                bridge_diffs: List[Tuple[int, int, float, str, Any, datetime, bool, int, Dict[str, Any], Dict[str, Any]]] = []
                 for uh in u_h:
                     for hv in h_v:
                         p1, d1 = uh.get("place", ""), uh.get("dist", "")
@@ -1029,6 +1030,7 @@ def compute_pairwise_results(
                         if not bridge_priority:
                             continue
 
+                        course_bonus = _hidden_bridge_current_course_bonus(bridge_priority, p1, p2, target_course)
                         est = uh["diff"] + hv["diff"]
                         dt = min(_entry_sort_date(uh), _entry_sort_date(hv))
                         is_current_same = (
@@ -1038,37 +1040,44 @@ def compute_pairwise_results(
                             and str(d2) == str(cur_dist)
                         )
                         bridge_rank = min(_safe_rank(uh.get("self_rank")), _safe_rank(hv.get("opp_rank")))
-                        bridge_diffs.append((bridge_priority, est, p1, d1, dt, is_current_same, bridge_rank, uh, hv))
+                        bridge_diffs.append((bridge_priority, course_bonus, est, p1, d1, dt, is_current_same, bridge_rank, uh, hv))
 
                 if not bridge_diffs:
                     continue
+
                 best_priority = max(x[0] for x in bridge_diffs)
                 target_diffs = [x for x in bridge_diffs if x[0] == best_priority]
-                target_diffs.sort(key=lambda x: _rank_sort_key(x[6], x[4]))
+                if best_priority == 2:
+                    best_course_bonus = max(x[1] for x in target_diffs)
+                    target_diffs = [x for x in target_diffs if x[1] == best_course_bonus]
+
+                target_diffs.sort(key=lambda x: _rank_sort_key(x[7], x[5]))
                 best = target_diffs[0]
-                discount = 0.7 if best[5] else (0.35 if best_priority == 1 else 0.5)
+                discount = 0.7 if best[6] else (0.35 if best_priority == 1 else 0.5)
                 candidates.append({
-                    "diff": best[1] * discount,
-                    "is_strict": best[5],
-                    "place": best[2],
-                    "dist": best[3],
-                    "water": best[7].get("water"),
-                    "date": best[4],
-                    "date_str": best[7].get("date_str", ""),
-                    "url": best[7].get("url", ""),
-                    "title": best[7].get("title", ""),
+                    "diff": best[2] * discount,
+                    "is_strict": best[6],
+                    "place": best[3],
+                    "dist": best[4],
+                    "water": best[8].get("water"),
+                    "date": best[5],
+                    "date_str": best[8].get("date_str", ""),
+                    "url": best[8].get("url", ""),
+                    "title": best[8].get("title", ""),
                     "route": f"hidden:{h}",
                     "via_horse": h,
-                    "via_leg1": dict(best[7]),
-                    "via_leg2": dict(best[8]),
+                    "via_leg1": dict(best[8]),
+                    "via_leg2": dict(best[9]),
                     "bridge_priority": best_priority,
-                    "rank": best[6],
+                    "bridge_current_course_bonus": best[1],
+                    "rank": best[7],
                 })
 
             if candidates:
                 candidates.sort(
                     key=lambda x: (
                         int(x.get("bridge_priority", 0)),
+                        int(x.get("bridge_current_course_bonus", 0)),
                         -_safe_rank(x.get("rank")),
                         _entry_sort_date(x),
                         abs(x.get("diff", 0.0)),
@@ -1273,7 +1282,6 @@ def evaluate_and_rank(
             level_by_comp[loser_idx] = max(level_by_comp[loser_idx], level_by_comp[idx] + 1)
 
     tier_by_level = {0: "S", 1: "A", 2: "B"}
-
     tier_base = {"S": 400000, "A": 300000, "B": 200000, "C": 100000}
     tier_map: Dict[str, str] = {}
     ranked: List[Tuple[str, int]] = []
@@ -1661,6 +1669,7 @@ with st.expander("この版の修正点", expanded=False):
 - ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度と循環整理から S/A/B/C を決めます。
 - 直接対決を最優先し、同場同距離 → 同場 → 同距離の順で最も強い材料を採用します。
 - 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場経由は0.5倍、同距離経由は0.35倍に割引します。
+- 隠れ馬経由の優先度2「同競馬場・距離違い」では、その中でも今回の競馬場を優先します。
 - 比較が三すくみになった場合は、より信頼度の高い条件の矢印を残して弱い条件の矢印を外してからランク化します。
 - ばんえいは水分量 `2.0%未満` / `2.0%以上` で比較対象を絞れます。不等号は `5秒 / 15秒` 閾値です。
         """
