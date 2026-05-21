@@ -10,7 +10,10 @@ NAR公式サイト専用 物差し能力比較 Streamlit 完全版
     - netkeiba / 南関東公式 / keibabook からは相対比較データを取得しない。
     - 成績表のタイムは「タイム」列から読む。行全体から 54.0 などを拾わない。
       これにより、斤量を着順・タイムと誤認する事故を避ける。
-    - 隠れ馬経由の比較では、優先度2「同競馬場・距離違い」の中で今回の競馬場を優先する。
+    - 能力比較は同競馬場・同距離を最優先する。同条件で勝敗が割れる場合は互角扱いにする。
+    - 同条件で比較できない場合のみ、同競馬場の近い別距離、最後に別競馬場同距離を参考にする。
+    - 三すくみが起きた場合は、同競馬場・同距離の矢印を優先して弱い条件の矢印を外す。
+    - 隠れ馬経由の比較では、優先度2「同競馬場・近い距離違い」の中で今回の競馬場を優先する。
     - ばんえいの水分量フィルタは該当水分量を最優先する。
       水分違いレースは最後の参考材料としてだけ使い、15秒以上でのみ >/< を出す。
       通常材料でランク付けできる馬には、水分違い材料をランクへ混ぜない。
@@ -857,11 +860,21 @@ def build_comparison_graph(
             dt = hi.get("date")
             return dt if isinstance(dt, datetime) else datetime.min
 
-        d["history"].sort(key=lambda x: (hist_rank(x), -hist_date(x).timestamp() if hist_date(x) != datetime.min else 0))
+        d["history"].sort(
+            key=lambda x: (
+                0 if x.get("is_exact") else 1,
+                hist_rank(x),
+                -hist_date(x).timestamp() if hist_date(x) != datetime.min else 0,
+            )
+        )
         seen = set()
         deduped = []
         for hi in d["history"]:
-            if is_banei and water_filter_bucket is not None:
+            # 同競馬場・同距離は「勝ったり負けたり」を見たいので、同じ place/dist で潰さない。
+            # URL単位で重複だけ除外する。
+            if hi.get("is_exact"):
+                key = ("exact", hi.get("url", ""), hi.get("date_str", ""), hi.get("title", ""))
+            elif is_banei and water_filter_bucket is not None:
                 key = (hi.get("place", ""), hi.get("dist", ""), hi.get("water_bucket"))
             else:
                 key = (hi.get("place", ""), hi.get("dist", ""))
@@ -921,23 +934,68 @@ def _ooi_track_side(dist: Any) -> str:
     return ""
 
 
+def _is_near_distance(place: str, dist1: Any, dist2: Any) -> bool:
+    """
+    「近い別距離」として許す範囲。
+    - 同距離は当然 True
+    - 大井は内回り/外回りが変わる距離は別物として除外
+    - それ以外は同じコース形態、かつ 400m 以内だけを近距離扱い
+      例: 大井1200⇔1400、浦和1400⇔1500、川崎1400⇔1600 など
+    """
+    d1 = int(dist1) if str(dist1).isdigit() else 0
+    d2 = int(dist2) if str(dist2).isdigit() else 0
+    if not place or d1 <= 0 or d2 <= 0:
+        return False
+    if d1 == d2:
+        return True
+    if abs(d1 - d2) > 400:
+        return False
+    if place == "大井" and _ooi_track_side(d1) != _ooi_track_side(d2):
+        return False
+    return is_same_track_layout(place, d1, d2)
+
+
 def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> int:
+    """
+    直接対決の採用優先度。数字が大きいほど強い材料。
+
+    4: 今回と同競馬場・同距離
+    3: 今回と同競馬場・近い別距離
+    1: 別競馬場だが同距離
+    0: 採用しない
+
+    重要:
+    同競馬場・同距離が1件でもある場合、近い別距離や別競馬場同距離は
+    compute_pairwise_results 側で採用されない。
+    """
     d = int(dist) if str(dist).isdigit() else 0
     cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
     if not place or d <= 0 or cur_dist <= 0:
         return 0
+
     if place == target_course:
         if d == cur_dist:
+            return 4
+        if _is_near_distance(place, d, cur_dist):
             return 3
-        if place == "大井" and _ooi_track_side(d) != _ooi_track_side(cur_dist):
-            return 0
-        return 2
+        return 0
+
     if d == cur_dist:
         return 1
+
     return 0
 
 
 def _hidden_bridge_priority(place1: str, dist1: Any, place2: str, dist2: Any) -> int:
+    """
+    物差し馬経由の2本の比較が同質かどうかを判定する。
+    直接対決よりは弱い材料として扱うが、ここでも「同場同距」を最優先する。
+
+    3: 2本とも同競馬場・同距離
+    2: 2本とも同競馬場・近い別距離
+    1: 競馬場は違うが同距離
+    0: 採用しない
+    """
     d1 = int(dist1) if str(dist1).isdigit() else 0
     d2 = int(dist2) if str(dist2).isdigit() else 0
     if not place1 or not place2 or d1 <= 0 or d2 <= 0:
@@ -945,9 +1003,9 @@ def _hidden_bridge_priority(place1: str, dist1: Any, place2: str, dist2: Any) ->
     if place1 == place2:
         if d1 == d2:
             return 3
-        if place1 == "大井" and _ooi_track_side(d1) != _ooi_track_side(d2):
-            return 0
-        return 2
+        if _is_near_distance(place1, d1, d2):
+            return 2
+        return 0
     if d1 == d2:
         return 1
     return 0
@@ -961,18 +1019,40 @@ def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place
 
 
 def _entry_rank_priority(entry: Dict[str, Any]) -> int:
-    """順位化用の信頼度。小さいほど強い条件。"""
+    """
+    順位化・三すくみ整理用の信頼度。小さいほど強い条件。
+
+    0: 直接対決・同競馬場同距離
+    2: 直接対決・同競馬場近距離
+    3: 直接対決・別競馬場同距離
+    4: 物差し馬経由・同場同距相当
+    5: 物差し馬経由・同場近距離相当
+    6: 物差し馬経由・別場同距離相当
+    9: 水分違い等の参考材料
+    """
     if entry.get("water_mismatch_reference"):
-        return 5
-    bridge_priority = int(entry.get("bridge_priority") or 0)
-    if bridge_priority:
-        return 4 - bridge_priority
+        return 9
+
     direct_priority = int(entry.get("direct_priority") or 0)
-    if direct_priority:
-        return 4 - direct_priority
+    if direct_priority == 4:
+        return 0
+    if direct_priority == 3:
+        return 2
+    if direct_priority == 1:
+        return 3
+
+    bridge_priority = int(entry.get("bridge_priority") or 0)
+    if bridge_priority == 3:
+        return 4
+    if bridge_priority == 2:
+        return 5
+    if bridge_priority == 1:
+        return 6
+
     if entry.get("is_strict"):
         return 1
-    return 4
+    return 8
+
 
 
 def compute_pairwise_results(
@@ -1004,7 +1084,7 @@ def compute_pairwise_results(
                     rank = min(_safe_rank(hi.get("self_rank")), _safe_rank(hi.get("opp_rank")))
                     priority_entries.append({
                         "diff": hi["diff"],
-                        "is_strict": priority == 3,
+                        "is_strict": priority == 4,
                         "place": place,
                         "dist": dist,
                         "water": hi.get("water"),
@@ -1030,7 +1110,13 @@ def compute_pairwise_results(
                     best_priority = max(e["direct_priority"] for e in target_pool)
                     target_direct = [e for e in target_pool if e["direct_priority"] == best_priority]
                     target_direct.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
-                    pair_net[u][v].append(target_direct[0])
+
+                    # 同競馬場・同距離の直接対決は、勝ったり負けたりを検出するため複数件残す。
+                    # それ以外の近距離・別場同距離は、同条件が無い時だけ代表1件を使う。
+                    if best_priority == 4:
+                        pair_net[u][v].extend(target_direct[:5])
+                    else:
+                        pair_net[u][v].append(target_direct[0])
                 if pair_net[u][v]:
                     continue
 
@@ -1151,7 +1237,13 @@ def compute_matchup_matrix(
             best_is_strict = any(e.get("is_strict") for e in entries)
             target_entries = [e for e in entries if bool(e.get("is_strict")) == best_is_strict]
             target_entries.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
-            target_entries = target_entries[:1] if best_bridge_priority else target_entries[:3]
+            if best_bridge_priority:
+                target_entries = target_entries[:1]
+            elif best_is_strict:
+                # 同競馬場・同距離の直接対決は複数件を使い、勝敗が割れたら互角にする。
+                target_entries = target_entries[:5]
+            else:
+                target_entries = target_entries[:3]
             is_water_mismatch_reference = any(e.get("water_mismatch_reference") for e in target_entries)
             draw_th, strong_th = thresholds(is_banei, best_is_strict, is_water_mismatch_reference)
 
@@ -1754,10 +1846,11 @@ with st.expander("この版の修正点", expanded=False):
 - データ元は引き続き NAR公式の `DebaTable` と `RaceMarkTable` だけです。
 - 成績表はヘッダから `着順`・`馬番`・`タイム` 列を特定して読みます。行全体から `54.0` のような数字を拾わないため、斤量誤認を避けます。
 - ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度と循環整理から S/A/B/C を決めます。
-- 直接対決を最優先し、同場同距離 → 同場 → 同距離の順で最も強い材料を採用します。
-- 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場経由は0.5倍、同距離経由は0.35倍に割引します。
-- 隠れ馬経由の優先度2「同競馬場・距離違い」では、その中でも今回の競馬場を優先します。
-- 比較が三すくみになった場合は、より信頼度の高い条件の矢印を残して弱い条件の矢印を外してからランク化します。
+- 直接対決を最優先し、同場同距離 → 同場近距離 → 別場同距離の順で最も強い材料を採用します。
+- 同場同距離の直接対決が複数あり、勝ったり負けたりしている場合は互角扱いにします。
+- 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場近距離経由は0.5倍、同距離経由は0.35倍に割引します。
+- 隠れ馬経由の優先度2「同競馬場・近い距離違い」では、その中でも今回の競馬場を優先します。
+- 比較が三すくみになった場合は、同場同距離の矢印を最優先し、弱い条件の矢印を外してからランク化します。
 - ばんえいは該当水分量を最優先します。水分違いは小さく参考表示し、通常材料でランク付けできる馬には混ぜません。
         """
     )
