@@ -53,6 +53,27 @@ LOCAL_PLACES = [
     "帯広", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎",
     "金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀",
 ]
+
+# NAR公式URLの k_babaCode は競馬場を一意に表すので、ページ本文より優先する。
+# ページ本文には「本日の開催場メニュー」や各馬の過去走が混在し、そこで先に出た競馬場名を
+# 誤って拾うことがあるため、競馬場判定はこの対応表を第一優先にする。
+BABA_CODE_TO_PLACE = {
+    "3": "帯広",
+    "10": "盛岡",
+    "11": "水沢",
+    "18": "浦和",
+    "19": "船橋",
+    "20": "大井",
+    "21": "川崎",
+    "22": "金沢",
+    "23": "笠松",
+    "24": "名古屋",
+    "27": "園田",
+    "28": "姫路",
+    "30": "門別",
+    "31": "高知",
+    "32": "佐賀",
+}
 PLACE_RE = re.compile("(" + "|".join(map(re.escape, LOCAL_PLACES)) + ")")
 TIME_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}\.\d|\d{1,3}\.\d)(?!\d)")
 RANK_SPECIALS = ("中止", "取消", "除外", "失格", "降着")
@@ -81,7 +102,61 @@ def normalize_place_text(text: str) -> str:
     return re.sub(r"\s+", "", clean_text(text))
 
 
+def normalize_baba_code(code: Any) -> str:
+    s = str(code or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return str(int(s))
+    return s
+
+
+def place_from_baba_code(code: Any) -> str:
+    return BABA_CODE_TO_PLACE.get(normalize_baba_code(code), "不明")
+
+
+def _race_header_window(text: str) -> str:
+    """NARページ上部の「YYYY年M月D日 競馬場 第n競走」周辺だけを抜き出す。"""
+    s = clean_text(text)
+    m = re.search(r"\d{4}年\s*\d{1,2}月\s*\d{1,2}日.{0,80}?第\s*\d+\s*競走", s)
+    if not m:
+        return ""
+    # 開催場メニューなど、見出しより前に出た別競馬場名を拾わないように
+    # 必ず日付見出しの位置から後ろだけを見る。
+    start = m.start()
+    end = min(len(s), m.end() + 900)
+    return s[start:end]
+
+
+def extract_place_from_race_header(text: str) -> str:
+    window = _race_header_window(text)
+    if not window:
+        return "不明"
+    m = PLACE_RE.search(normalize_place_text(window))
+    return m.group(1) if m else "不明"
+
+
+def extract_distance_from_race_header(text: str) -> str:
+    window = _race_header_window(text)
+    if window:
+        d = extract_distance(window)
+        if d != "不明":
+            return d
+    return "不明"
+
+
+def extract_water_from_race_header(text: str) -> Optional[float]:
+    window = _race_header_window(text)
+    if window:
+        w = extract_water(window)
+        if w is not None:
+            return w
+    return None
+
+
 def extract_place(text: str) -> str:
+    # 小さな過去走テキスト用。ページ全体の競馬場判定には parse_page_meta 側で
+    # k_babaCode とレース見出しを優先する。
     m = PLACE_RE.search(normalize_place_text(text))
     return m.group(1) if m else "不明"
 
@@ -392,10 +467,20 @@ class NarOfficialScraper:
 
     def parse_page_meta(self, soup: BeautifulSoup, fallback_key: Optional[NarRaceKey] = None) -> Dict[str, Any]:
         text = clean_text(soup)
-        course = extract_place(text)
-        distance = extract_distance(text)
-        water = extract_water(text)
-        dt = parse_date_any(text)
+
+        # 競馬場は URL の k_babaCode を最優先。ページ本文には開催場メニューや過去走が混ざるため、
+        # 本文の先頭一致だけで判定すると「高知1400」が「水沢1400」等に化けることがある。
+        code_course = place_from_baba_code(fallback_key.baba_code) if fallback_key else "不明"
+        header_course = extract_place_from_race_header(text)
+        course = code_course if code_course != "不明" else header_course if header_course != "不明" else extract_place(text)
+
+        # 距離・馬場状態も、まずレース見出し直下の条件欄から読む。
+        # 取れなかった場合だけ従来の全文探索にフォールバックする。
+        header_distance = extract_distance_from_race_header(text)
+        distance = header_distance if header_distance != "不明" else extract_distance(text)
+        header_water = extract_water_from_race_header(text)
+        water = header_water if header_water is not None else extract_water(text)
+        dt = parse_date_any(_race_header_window(text) or text)
 
         title = ""
         for h in soup.find_all(["h2", "h3", "h4"]):
@@ -518,22 +603,26 @@ class NarOfficialScraper:
             for pos, u in enumerate(urls):
                 hint = hints[pos] if pos < len(hints) else {}
                 rn = qparam(u, "k_raceNo") or "0"
+                past_baba_code = str(qparam(u, "k_babaCode") or key.baba_code)
+                past_course_by_code = place_from_baba_code(past_baba_code)
+                past_course_hint = past_course_by_code if past_course_by_code != "不明" else hint.get("course_hint", "不明")
                 past_links.append(PastLink(
                     current_horse=horse_name,
                     url=u,
                     race_date=(qparam(u, "k_raceDate") or "").replace("-", "/"),
                     race_no=int(rn) if rn.isdigit() else 0,
-                    baba_code=str(qparam(u, "k_babaCode") or key.baba_code),
+                    baba_code=past_baba_code,
                     date_hint=hint.get("date_hint", datetime.min),
                     water_hint=hint.get("water_hint"),
-                    course_hint=hint.get("course_hint", "不明"),
+                    course_hint=past_course_hint,
                     distance_hint=hint.get("distance_hint", "不明"),
                 ))
 
-        is_banei = meta["course"] == "帯広" or key.baba_code == "3" or "ばんえい" in clean_text(soup)
+        is_banei = meta["course"] == "帯広" or normalize_baba_code(key.baba_code) == "3" or "ばんえい" in clean_text(soup)
         debug = {
             "deba_url": canonical_url,
             "title": meta["title"],
+            "target_baba_code": normalize_baba_code(key.baba_code),
             "target_course": meta["course"],
             "target_distance": meta["distance"],
             "target_water": meta["water"],
