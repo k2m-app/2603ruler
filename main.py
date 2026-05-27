@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import networkx as nx
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -73,6 +74,7 @@ BABA_CODE_TO_PLACE = {
     "30": "門別",
     "31": "高知",
     "32": "佐賀",
+    "36": "門別",
 }
 PLACE_RE = re.compile("(" + "|".join(map(re.escape, LOCAL_PLACES)) + ")")
 TIME_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,2}:\d{2}\.\d|\d{1,3}\.\d)(?!\d)")
@@ -700,6 +702,20 @@ class NarOfficialScraper:
 
         cells = self._cells_for_result_row(row)
         if not cells:
+            return None
+
+        # 取消・除外・中止・失格・降着などの特殊結果は、タイム差を算出できない。
+        # NARの成績表/出馬表では、特殊結果の行にも別セルに過去タイムや
+        # 1着馬タイムのような数値が残るケースがあり、それを拾うと「着差0.0秒」扱いになる。
+        # そのため、タイム列を探す前に行全体と着順セルを確認し、測定不能として比較対象から外す。
+        row_text = clean_text(row)
+        rank_cell_text = ""
+        rank_idx = header_map.get("rank")
+        if rank_idx is not None and rank_idx < len(cells):
+            rank_cell_text = clean_text(cells[rank_idx])
+        else:
+            rank_cell_text = clean_text(cells[0]) if cells else ""
+        if any(kw in rank_cell_text for kw in RANK_SPECIALS) or any(kw in row_text for kw in ("取消", "除外")):
             return None
 
         def cell_text(key: str, fallback_idx: Optional[int] = None) -> str:
@@ -1934,6 +1950,7 @@ with st.expander("この版の修正点", expanded=False):
         """
 - データ元は引き続き NAR公式の `DebaTable` と `RaceMarkTable` だけです。
 - 成績表はヘッダから `着順`・`馬番`・`タイム` 列を特定して読みます。行全体から `54.0` のような数字を拾わないため、斤量誤認を避けます。
+- `取消`・`除外` などタイム差を測定できない結果は、着差0.0秒ではなく比較対象外として扱います。
 - ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度と循環整理から S/A/B/C を決めます。
 - 直接対決を最優先し、同場同距離 → 同場近距離 → 別場同距離の順で最も強い材料を採用します。
 - 同場同距離の直接対決が複数あり、勝ったり負けたりしている場合は互角扱いにします。
@@ -1944,10 +1961,69 @@ with st.expander("この版の修正点", expanded=False):
         """
     )
 
+def _query_param_first(name: str) -> str:
+    """Streamlitのバージョン差を吸収してクエリパラメータを1つ取り出す。"""
+    try:
+        value = st.query_params.get(name, "")
+    except Exception:
+        value = ""
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value or "")
+
+
+clip_url = _query_param_first("clip_url")
+if "nar_url_input" not in st.session_state:
+    st.session_state["nar_url_input"] = ""
+if clip_url and clip_url != st.session_state.get("_last_clip_url", ""):
+    st.session_state["nar_url_input"] = clip_url
+    st.session_state["_last_clip_url"] = clip_url
+
 url_input = st.text_input(
     "NAR公式の出馬表URL",
-    value="https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=2026%2f04%2f26&k_raceNo=1&k_babaCode=3",
-    placeholder="https://www.keiba.go.jp/KeibaWeb/TodayRaceInfo/DebaTable?k_raceDate=YYYY%2fMM%2fDD&k_raceNo=1&k_babaCode=3",
+    key="nar_url_input",
+    placeholder="NAR公式の出馬表URLを入力・貼り付けしてください",
+)
+
+components.html(
+    """
+    <button
+      type="button"
+      onclick="pasteClipboardToStreamlit()"
+      style="
+        width: 100%;
+        border: 1px solid #d0d7de;
+        border-radius: 8px;
+        padding: 10px 12px;
+        background: #ffffff;
+        color: #24292f;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+      "
+    >
+      📋 今クリップボードでコピーしているものをクリックして貼り付け
+    </button>
+    <div id="clipboard-message" style="margin-top:6px;font-size:12px;color:#6a737d;"></div>
+    <script>
+    async function pasteClipboardToStreamlit() {
+      const msg = document.getElementById("clipboard-message");
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+          msg.textContent = "クリップボードが空です。";
+          return;
+        }
+        const params = new URLSearchParams(window.parent.location.search);
+        params.set("clip_url", text);
+        window.parent.location.search = params.toString();
+      } catch (e) {
+        msg.textContent = "ブラウザの権限によりクリップボードを読めません。手動で貼り付けてください。";
+      }
+    }
+    </script>
+    """,
+    height=78,
 )
 
 st.markdown("---")
