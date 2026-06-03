@@ -50,6 +50,12 @@ BASE = "https://www.keiba.go.jp"
 NAR_TODAY_BASE = BASE + "/KeibaWeb/TodayRaceInfo/"
 REQUEST_INTERVAL_SEC = 0.22
 
+# keiba_bot.py の相対評価で使っている「相対日」ウィンドウ。
+# 基本は9ヶ月以内、9〜12ヶ月は同場同距離または同場同レイアウト±200mのみ採用。
+RELATIVE_PAST_DAYS_DEFAULT = 274   # ≒ 9ヶ月
+RELATIVE_PAST_DAYS_EXTENDED = 365  # 12ヶ月
+RELATIVE_EXTENDED_DIST_DIFF = 200
+
 LOCAL_PLACES = [
     "帯広", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎",
     "金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀",
@@ -200,6 +206,13 @@ def _to_float(x: Any) -> Optional[float]:
         return float(str(x).replace(",", ""))
     except Exception:
         return None
+
+
+def _dist_to_int(dist: Any) -> int:
+    try:
+        return int(str(dist).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0
 
 
 def parse_time_token(token: str) -> Optional[float]:
@@ -362,6 +375,60 @@ def get_track_layout(place: str, dist: Any) -> str:
 
 def is_same_track_layout(place: str, dist1: Any, dist2: Any) -> bool:
     return get_track_layout(place, dist1) == get_track_layout(place, dist2)
+
+
+def is_relative_distance_allowed(dist: Any, current_dist: Any) -> bool:
+    """keiba_bot.py と同じく、今回距離から600m以上離れた過去レースは相対評価に使わない。"""
+    d = _dist_to_int(dist)
+    cur_d = _dist_to_int(current_dist)
+    if d <= 0 or cur_d <= 0:
+        return True
+    if d >= 1700 and cur_d >= 1700:
+        return True
+    return abs(d - cur_d) < 600
+
+
+def is_past_race_within_relative_window(
+    race_date: Any,
+    race_place: str,
+    race_dist: Any,
+    current_place: str,
+    current_dist: Any,
+    today: Optional[datetime] = None,
+) -> bool:
+    """keiba_bot.py の相対日ロジック。
+
+    基本は9ヶ月以内。9〜12ヶ月の古い過去走は、同場同距離または
+    同場・同レイアウト・距離差±200m以内だけを救済採用する。
+    日付が取れない場合は、NAR公式データ不足時の比較枯渇を避けるため採用する。
+    """
+    if isinstance(race_date, datetime):
+        dt = race_date
+    else:
+        dt = parse_date_any(str(race_date or ""))
+    if dt == datetime.min:
+        return True
+
+    today = today or datetime.now()
+    days_diff = (today - dt).days
+    if days_diff < 0:
+        return True
+    if days_diff <= RELATIVE_PAST_DAYS_DEFAULT:
+        return True
+    if days_diff > RELATIVE_PAST_DAYS_EXTENDED:
+        return False
+
+    r_d = _dist_to_int(race_dist)
+    c_d = _dist_to_int(current_dist)
+    if not race_place or not current_place or r_d <= 0 or c_d <= 0:
+        return False
+    if race_place != current_place:
+        return False
+    if r_d == c_d:
+        return True
+    if is_same_track_layout(race_place, r_d, c_d) and abs(r_d - c_d) <= RELATIVE_EXTENDED_DIST_DIFF:
+        return True
+    return False
 
 
 # ==========================================
@@ -934,6 +1001,15 @@ def build_comparison_graph(
             G.add_edge(h1, h2, history=[history], diffs=[capped], rank_diff=capped)
 
     for race in past_races:
+        # keiba_bot.py の相対日ロジックを適用。
+        # 取得元は変えず、NAR公式から取得した過去結果のうち相対評価に使う範囲だけを絞る。
+        if not is_past_race_within_relative_window(
+            race.race_date, race.course, race.distance, target_course, target_distance
+        ):
+            continue
+        if not is_relative_distance_allowed(race.distance, target_distance):
+            continue
+
         h_list = [(h, t) for h, t in race.horses.items() if t is not None]
         current_in_race = [(h, t) for h, t in h_list if h in current_names]
         if not current_in_race:
@@ -1951,7 +2027,8 @@ with st.expander("この版の修正点", expanded=False):
 - データ元は引き続き NAR公式の `DebaTable` と `RaceMarkTable` だけです。
 - 成績表はヘッダから `着順`・`馬番`・`タイム` 列を特定して読みます。行全体から `54.0` のような数字を拾わないため、斤量誤認を避けます。
 - `取消`・`除外` などタイム差を測定できない結果は、着差0.0秒ではなく比較対象外として扱います。
-- ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度と循環整理から S/A/B/C を決めます。
+- ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度・相対日の採用範囲・循環整理から S/A/B/C を決めます。
+- 相対評価の過去走は基本9ヶ月以内、9〜12ヶ月は同場同距離または同場同レイアウト±200m以内のみ採用します。
 - 直接対決を最優先し、同場同距離 → 同場近距離 → 別場同距離の順で最も強い材料を採用します。
 - 同場同距離の直接対決が複数あり、勝ったり負けたりしている場合は互角扱いにします。
 - 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場近距離経由は0.5倍、同距離経由は0.35倍に割引します。
@@ -2002,10 +2079,27 @@ components.html(
         cursor: pointer;
       "
     >
-      📋 今クリップボードでコピーしているものをクリックして貼り付け
+      📋 コピー中のURL/テキストをクリックして入力欄に反映
     </button>
     <div id="clipboard-message" style="margin-top:6px;font-size:12px;color:#6a737d;"></div>
     <script>
+    function setParentStreamlitInput(text) {
+      const doc = window.parent.document;
+      const inputs = Array.from(doc.querySelectorAll('input'));
+      const target = inputs.find(el =>
+        (el.getAttribute('aria-label') || '').includes('NAR公式の出馬表URL') ||
+        (el.placeholder || '').includes('NAR公式の出馬表URL')
+      );
+      if (!target) return false;
+
+      const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+      setter.call(target, text);
+      target.dispatchEvent(new Event('input', { bubbles: true }));
+      target.dispatchEvent(new Event('change', { bubbles: true }));
+      target.focus();
+      return true;
+    }
+
     async function pasteClipboardToStreamlit() {
       const msg = document.getElementById("clipboard-message");
       try {
@@ -2014,9 +2108,17 @@ components.html(
           msg.textContent = "クリップボードが空です。";
           return;
         }
-        const params = new URLSearchParams(window.parent.location.search);
-        params.set("clip_url", text);
-        window.parent.location.search = params.toString();
+
+        const reflected = setParentStreamlitInput(text);
+        msg.textContent = reflected
+          ? "入力欄へ反映しました。"
+          : "入力欄が見つからないため、画面を更新して反映します。";
+
+        if (!reflected) {
+          const params = new URLSearchParams(window.parent.location.search);
+          params.set("clip_url", text);
+          window.parent.location.search = params.toString();
+        }
       } catch (e) {
         msg.textContent = "ブラウザの権限によりクリップボードを読めません。手動で貼り付けてください。";
       }
