@@ -2066,7 +2066,7 @@ components.html(
     """
     <button
       type="button"
-      onclick="pasteClipboardToStreamlit()"
+      onclick="pasteClipboardToUrlInput()"
       style="
         width: 100%;
         border: 1px solid #d0d7de;
@@ -2079,46 +2079,81 @@ components.html(
         cursor: pointer;
       "
     >
-      📋 コピー中のURL/テキストをクリックして入力欄に反映
+      📋 コピー中のURL/テキストを上のURL入力フォームに貼り付け
     </button>
     <div id="clipboard-message" style="margin-top:6px;font-size:12px;color:#6a737d;"></div>
     <script>
-    function setParentStreamlitInput(text) {
+    function visible(el) {
+      const r = el.getBoundingClientRect();
+      const style = window.parent.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    }
+
+    function findUrlInput() {
       const doc = window.parent.document;
-      const inputs = Array.from(doc.querySelectorAll('input'));
-      const target = inputs.find(el =>
+      const inputs = Array.from(doc.querySelectorAll('input[type="text"], input:not([type])')).filter(visible);
+
+      // まずラベル/placeholderで、ボタン上のNAR公式URL入力フォームを厳密に探す。
+      let target = inputs.find(el =>
         (el.getAttribute('aria-label') || '').includes('NAR公式の出馬表URL') ||
         (el.placeholder || '').includes('NAR公式の出馬表URL')
       );
-      if (!target) return false;
+      if (target) return target;
 
-      const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
-      setter.call(target, text);
-      target.dispatchEvent(new Event('input', { bubbles: true }));
-      target.dispatchEvent(new Event('change', { bubbles: true }));
-      target.focus();
-      return true;
+      // StreamlitのDOM変更対策。component iframeより画面上で上にある直近のテキスト入力欄を使う。
+      const iframe = window.frameElement;
+      if (iframe) {
+        const iframeTop = iframe.getBoundingClientRect().top;
+        const above = inputs
+          .map(el => ({ el, rect: el.getBoundingClientRect() }))
+          .filter(x => x.rect.top < iframeTop)
+          .sort((a, b) => b.rect.top - a.rect.top);
+        if (above.length) return above[0].el;
+      }
+
+      return inputs[0] || null;
     }
 
-    async function pasteClipboardToStreamlit() {
+    function setStreamlitInputValue(input, text) {
+      input.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      input.focus();
+
+      const proto = window.parent.HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) {
+        setter.call(input, text);
+      } else {
+        input.value = text;
+      }
+
+      input.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        composed: true,
+        inputType: 'insertFromPaste',
+        data: text
+      }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+      input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, composed: true, key: 'Enter' }));
+      input.focus();
+    }
+
+    async function pasteClipboardToUrlInput() {
       const msg = document.getElementById("clipboard-message");
       try {
-        const text = await navigator.clipboard.readText();
+        const text = (await navigator.clipboard.readText()).trim();
         if (!text) {
           msg.textContent = "クリップボードが空です。";
           return;
         }
 
-        const reflected = setParentStreamlitInput(text);
-        msg.textContent = reflected
-          ? "入力欄へ反映しました。"
-          : "入力欄が見つからないため、画面を更新して反映します。";
-
-        if (!reflected) {
-          const params = new URLSearchParams(window.parent.location.search);
-          params.set("clip_url", text);
-          window.parent.location.search = params.toString();
+        const input = findUrlInput();
+        if (!input) {
+          msg.textContent = "URL入力フォームが見つかりません。手動で貼り付けてください。";
+          return;
         }
+
+        setStreamlitInputValue(input, text);
+        msg.textContent = "上のURL入力フォームへ貼り付けました。";
       } catch (e) {
         msg.textContent = "ブラウザの権限によりクリップボードを読めません。手動で貼り付けてください。";
       }
