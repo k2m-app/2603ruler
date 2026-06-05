@@ -56,6 +56,13 @@ RELATIVE_PAST_DAYS_DEFAULT = 274   # ≒ 9ヶ月
 RELATIVE_PAST_DAYS_EXTENDED = 365  # 12ヶ月
 RELATIVE_EXTENDED_DIST_DIFF = 200
 
+# keiba_bot(5).py 側の相対評価ロジックに合わせた条件判定用定数
+MAX_RELATIVE_DIST_DIFF = 600
+LONG_DISTANCE_MIN = 1700
+BRIDGE_RECENT_DAYS = 180
+BRIDGE_OLD_OK_DIST_MIN = 1800
+_BRIDGE_DISCOUNT_BY_PRIORITY = {5: 1.0, 4: 0.7, 3: 0.5, 2: 0.4, 1: 0.35}
+
 LOCAL_PLACES = [
     "帯広", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎",
     "金沢", "笠松", "名古屋", "園田", "姫路", "高知", "佐賀",
@@ -1136,65 +1143,231 @@ def _is_near_distance(place: str, dist1: Any, dist2: Any) -> bool:
     return is_same_track_layout(place, d1, d2)
 
 
-def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> int:
-    """
-    直接対決の採用優先度。数字が大きいほど強い材料。
+def _is_long_distance(dist: Any) -> bool:
+    return _dist_to_int(dist) >= LONG_DISTANCE_MIN
 
-    4: 今回と同競馬場・同距離
-    3: 今回と同競馬場・近い別距離
-    1: 別競馬場だが同距離
-    0: 採用しない
 
-    重要:
-    同競馬場・同距離が1件でもある場合、近い別距離や別競馬場同距離は
-    compute_pairwise_results 側で採用されない。
-    """
-    d = int(dist) if str(dist).isdigit() else 0
-    cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
-    if not place or d <= 0 or cur_dist <= 0:
+def _layout_turn_class(place: str, dist: Any) -> str:
+    """競馬場をまたいでコース形態（コーナー数）を揃えるためのターン分類。"""
+    d = _dist_to_int(dist)
+    if d <= 0 or not place:
+        return ""
+    if place == "大井":
+        if d <= 1400:
+            return "1turn"
+        if d <= 1650:
+            return "2turn_inner"
+        return "2turn_outer"
+    if place == "川崎":
+        if d == 900:
+            return "1turn"
+        if d <= 1600:
+            return "2turn"
+        return "multi_turn"
+    if place == "船橋":
+        if d <= 1200:
+            return "1turn"
+        if d <= 1800:
+            return "2turn"
+        return "multi_turn"
+    if place == "浦和":
+        if d <= 800:
+            return "1turn"
+        if d <= 1500:
+            return "2turn"
+        return "multi_turn"
+    # 南関以外は競馬場ごとの差が大きいため、無理に他場比較へ広げない。
+    return ""
+
+
+def _turn_classes_match(c1: str, c2: str) -> bool:
+    """ターン数が同じなら一致とみなす。大井の内外回りは同じ2turn系として扱う。"""
+    if not c1 or not c2:
+        return False
+    return c1.split("_")[0] == c2.split("_")[0]
+
+
+def _is_turn_match_to_current(place: str, dist: Any, current_place: str, current_dist: Any) -> bool:
+    """過去レースのターン分類が今回条件と一致するか。"""
+    cur_turn = _layout_turn_class(current_place, current_dist)
+    leg_turn = _layout_turn_class(place, dist)
+    return _turn_classes_match(cur_turn, leg_turn)
+
+
+def _race_condition_priority(place: str, dist: Any, current_place: str, current_dist: Any) -> int:
+    """keiba_bot(5).py 準拠の比較レース条件優先度。数字が大きいほど強い材料。"""
+    d = _dist_to_int(dist)
+    cur_d = _dist_to_int(current_dist)
+    if not place or not current_place or d <= 0 or cur_d <= 0:
+        return 0
+    if not is_relative_distance_allowed(d, cur_d):
         return 0
 
-    if place == target_course:
-        if d == cur_dist:
+    if _is_long_distance(cur_d):
+        if place == current_place and d == cur_d:
+            return 5
+        # 長距離は「同じ競馬場の同じコース形態」を最優先。
+        # 例: 船橋1800では、別形態の船橋2200より船橋1600/1500を近い条件として扱う。
+        if place == current_place and is_same_track_layout(place, d, cur_d):
             return 4
-        if _is_near_distance(place, d, cur_dist):
+        same_turn = _is_turn_match_to_current(place, d, current_place, cur_d)
+        if place == current_place and same_turn:
             return 3
+        if place == current_place and _is_long_distance(d):
+            return 2
+        if place != current_place and same_turn and _is_long_distance(d):
+            return 2
+        if place != current_place and same_turn:
+            return 1
         return 0
 
-    if d == cur_dist:
+    if place == current_place:
+        if d == cur_d:
+            return 5
+        if is_same_track_layout(place, d, cur_d):
+            return 4
+        return 3
+    if d == cur_d:
         return 1
-
     return 0
 
 
-def _hidden_bridge_priority(place1: str, dist1: Any, place2: str, dist2: Any) -> int:
+def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> int:
     """
-    物差し馬経由の2本の比較が同質かどうかを判定する。
-    直接対決よりは弱い材料として扱うが、ここでも「同場同距」を最優先する。
+    直接対決の採用優先度。keiba_bot(5).py の条件判定に寄せる。
 
-    3: 2本とも同競馬場・同距離
-    2: 2本とも同競馬場・近い別距離
-    1: 競馬場は違うが同距離
+    5: 今回と同競馬場・同距離
+    4: 今回と同競馬場・同レイアウト/同系統
+    3: 今回と同競馬場・ターン一致/近い別距離
+    2: 長距離で同場または他場の参考条件
+    1: 別競馬場だが同距離または同ターン参考
     0: 採用しない
     """
-    d1 = int(dist1) if str(dist1).isdigit() else 0
-    d2 = int(dist2) if str(dist2).isdigit() else 0
+    d = _dist_to_int(dist)
+    cur_dist = _dist_to_int(target_distance)
+    if d <= 0 or cur_dist <= 0:
+        return 0
+
+    # 南関はコーナー数が違う直接対決を混ぜない。
+    if target_course in ("大井", "船橋", "川崎", "浦和"):
+        if not _is_turn_match_to_current(place, d, target_course, cur_dist):
+            return 0
+    return _race_condition_priority(place, d, target_course, cur_dist)
+
+
+def _is_bridge_leg_recent_enough(leg_date: Any, leg_dist: Any, today: Optional[datetime] = None) -> bool:
+    """物差し馬経由の各レッグは原則180日以内。1800m以上はレース数が少ないため例外的に許容。"""
+    if _dist_to_int(leg_dist) >= BRIDGE_OLD_OK_DIST_MIN:
+        return True
+    dt = leg_date if isinstance(leg_date, datetime) else parse_date_any(str(leg_date or ""))
+    if not isinstance(dt, datetime) or dt == datetime.min:
+        return True
+    base = today or datetime.now()
+    return (base - dt).days <= BRIDGE_RECENT_DAYS
+
+
+def _hidden_bridge_priority(
+    place1: str,
+    dist1: Any,
+    place2: str,
+    dist2: Any,
+    current_dist: Any = None,
+    current_place: str = None,
+) -> int:
+    """keiba_bot(5).py 準拠の物差し馬経由優先度。
+
+    5: 両レッグが今回と同場・同距離
+    4: 両レッグが今回と同場・同レイアウト、または長距離同場同系統
+    3: 同場内の有力な距離違い/片レッグ同距離
+    2: 同場だがレイアウト違いを含む、または長距離他場同系統
+    1: 他場同系統の最終参考
+    0: 採用しない
+    """
+    d1 = _dist_to_int(dist1)
+    d2 = _dist_to_int(dist2)
+    cur_d = _dist_to_int(current_dist)
     if not place1 or not place2 or d1 <= 0 or d2 <= 0:
         return 0
+
+    if current_place and cur_d > 0:
+        if not (is_relative_distance_allowed(d1, cur_d) and is_relative_distance_allowed(d2, cur_d)):
+            return 0
+
+        # 南関は各レッグのターン分類が今回と一致しないものを採用しない。
+        if current_place in ("大井", "船橋", "川崎", "浦和"):
+            if not _is_turn_match_to_current(place1, d1, current_place, cur_d):
+                return 0
+            if not _is_turn_match_to_current(place2, d2, current_place, cur_d):
+                return 0
+
+        if _is_long_distance(cur_d):
+            leg1_base = _layout_turn_class(place1, d1).split("_")[0]
+            leg2_base = _layout_turn_class(place2, d2).split("_")[0]
+            if current_place in ("大井", "船橋", "川崎", "浦和") and (leg1_base in ("1turn", "") or leg2_base in ("1turn", "")):
+                return 0
+
+            if place1 == current_place and place2 == current_place:
+                if d1 == cur_d and d2 == cur_d:
+                    return 5
+                if _is_long_distance(d1) and _is_long_distance(d2) and d1 == d2:
+                    return 4
+                if d1 == d2:
+                    return 3
+                if is_same_track_layout(current_place, d1, cur_d) and is_same_track_layout(current_place, d2, cur_d):
+                    return 4 if (d1 == cur_d or d2 == cur_d) else 3
+                return 0
+
+            # 長距離の他場比較は、距離違いをむやみに混ぜない。
+            if place1 == place2 and d1 != d2:
+                return 0
+            if place1 != current_place and place2 != current_place:
+                if _is_long_distance(d1) and _is_long_distance(d2):
+                    if d1 == cur_d and d2 == cur_d:
+                        return 3
+                    if place1 == place2 and d1 == d2:
+                        return 2
+                    return 3
+                if place1 == place2 and d1 == d2:
+                    return 1
+                return 0
+            return 0
+
+        if place1 == current_place and place2 == current_place:
+            p1 = _race_condition_priority(place1, d1, current_place, cur_d)
+            p2 = _race_condition_priority(place2, d2, current_place, cur_d)
+            if p1 >= 5 and p2 >= 5:
+                return 5
+            if p1 >= 4 and p2 >= 4:
+                return 4
+            if (p1 >= 4 and p2 >= 3) or (p1 >= 3 and p2 >= 4):
+                return 3
+            return 2
+
+        if place1 == place2 and place1 != current_place:
+            if is_same_track_layout(place1, d1, d2):
+                if current_place in ("大井", "船橋", "川崎", "浦和"):
+                    cur_turn = _layout_turn_class(current_place, cur_d)
+                    leg_turn = _layout_turn_class(place1, d1)
+                    if not _turn_classes_match(cur_turn, leg_turn):
+                        return 0
+                if abs(d1 - cur_d) < 400 and abs(d2 - cur_d) < 400:
+                    return 1
+        return 0
+
+    # 今回条件が渡らない場合の保守フォールバック。
     if place1 == place2:
         if d1 == d2:
             return 3
+        if place1 == "大井" and _ooi_track_side(d1) != _ooi_track_side(d2):
+            return 0
         if _is_near_distance(place1, d1, d2):
             return 2
-        return 0
-    if d1 == d2:
-        return 1
     return 0
 
 
 def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place2: str, target_course: str) -> int:
-    """優先度2「同競馬場・距離違い」の中では今回の競馬場を優先する。"""
-    if bridge_priority == 2 and place1 == place2 == target_course:
+    """同じ優先度の物差し馬経由では、今回の競馬場を通る材料を優先する。"""
+    if bridge_priority in (2, 3, 4) and place1 == place2 == target_course:
         return 1
     return 0
 
@@ -1215,20 +1388,28 @@ def _entry_rank_priority(entry: Dict[str, Any]) -> int:
         return 9
 
     direct_priority = int(entry.get("direct_priority") or 0)
-    if direct_priority == 4:
+    if direct_priority == 5:
         return 0
+    if direct_priority == 4:
+        return 1
     if direct_priority == 3:
         return 2
-    if direct_priority == 1:
+    if direct_priority == 2:
         return 3
+    if direct_priority == 1:
+        return 4
 
     bridge_priority = int(entry.get("bridge_priority") or 0)
-    if bridge_priority == 3:
-        return 4
-    if bridge_priority == 2:
+    if bridge_priority == 5:
         return 5
-    if bridge_priority == 1:
+    if bridge_priority == 4:
         return 6
+    if bridge_priority == 3:
+        return 7
+    if bridge_priority == 2:
+        return 8
+    if bridge_priority == 1:
+        return 9
 
     if entry.get("is_strict"):
         return 1
@@ -1265,7 +1446,7 @@ def compute_pairwise_results(
                     rank = min(_safe_rank(hi.get("self_rank")), _safe_rank(hi.get("opp_rank")))
                     priority_entries.append({
                         "diff": hi["diff"],
-                        "is_strict": priority == 4,
+                        "is_strict": priority == 5,
                         "place": place,
                         "dist": dist,
                         "water": hi.get("water"),
@@ -1294,7 +1475,7 @@ def compute_pairwise_results(
 
                     # 同競馬場・同距離の直接対決は、勝ったり負けたりを検出するため複数件残す。
                     # それ以外の近距離・別場同距離は、同条件が無い時だけ代表1件を使う。
-                    if best_priority == 4:
+                    if best_priority == 5:
                         pair_net[u][v].extend(target_direct[:5])
                     else:
                         pair_net[u][v].append(target_direct[0])
@@ -1313,19 +1494,22 @@ def compute_pairwise_results(
                     for hv in h_v:
                         p1, d1 = uh.get("place", ""), uh.get("dist", "")
                         p2, d2 = hv.get("place", ""), hv.get("dist", "")
-                        bridge_priority = _hidden_bridge_priority(p1, d1, p2, d2)
+                        bridge_priority = _hidden_bridge_priority(
+                            p1, d1, p2, d2,
+                            current_dist=target_distance,
+                            current_place=target_course,
+                        )
                         if not bridge_priority:
+                            continue
+                        if not _is_bridge_leg_recent_enough(uh.get("date"), d1):
+                            continue
+                        if not _is_bridge_leg_recent_enough(hv.get("date"), d2):
                             continue
 
                         course_bonus = _hidden_bridge_current_course_bonus(bridge_priority, p1, p2, target_course)
                         est = uh["diff"] + hv["diff"]
                         dt = min(_entry_sort_date(uh), _entry_sort_date(hv))
-                        is_current_same = (
-                            p1 == target_course
-                            and p2 == target_course
-                            and str(d1) == str(cur_dist)
-                            and str(d2) == str(cur_dist)
-                        )
+                        is_current_same = bridge_priority == 5
                         bridge_rank = min(_safe_rank(uh.get("self_rank")), _safe_rank(hv.get("opp_rank")))
                         water_mismatch_reference = bool(
                             uh.get("water_mismatch_reference") or hv.get("water_mismatch_reference")
@@ -1345,7 +1529,7 @@ def compute_pairwise_results(
 
                 target_diffs.sort(key=lambda x: _rank_sort_key(x[7], x[5]))
                 best = target_diffs[0]
-                discount = 0.7 if best[6] else (0.35 if best_priority == 1 else 0.5)
+                discount = _BRIDGE_DISCOUNT_BY_PRIORITY.get(best_priority, 0.35)
                 candidates.append({
                     "diff": best[2] * discount,
                     "is_strict": best[6],
@@ -2017,24 +2201,14 @@ function openSubTab(evt, id) {{
 # 7. Streamlit UI
 # ==========================================
 
-st.set_page_config(page_title="NAR公式 物差し能力比較", page_icon="🏇", layout="wide")
-st.title("🏇 NAR公式 物差し能力比較")
-st.caption("地方競馬専用 / NAR公式から取得 / 直接対決優先 / 斤量を着順・タイムとして読まない安全パーサ")
+st.set_page_config(page_title="NAR物差し", page_icon="🏇", layout="wide")
+st.title("🏇 NAR物差し")
+st.caption("地方競馬専用 / NAR公式から取得")
 
 with st.expander("この版の修正点", expanded=False):
     st.markdown(
         """
 - データ元は引き続き NAR公式の `DebaTable` と `RaceMarkTable` だけです。
-- 成績表はヘッダから `着順`・`馬番`・`タイム` 列を特定して読みます。行全体から `54.0` のような数字を拾わないため、斤量誤認を避けます。
-- `取消`・`除外` などタイム差を測定できない結果は、着差0.0秒ではなく比較対象外として扱います。
-- ランク付けは添付 `keiba_bot.py` の「相対比較」ロジックに合わせ、比較条件の優先度・相対日の採用範囲・循環整理から S/A/B/C を決めます。
-- 相対評価の過去走は基本9ヶ月以内、9〜12ヶ月は同場同距離または同場同レイアウト±200m以内のみ採用します。
-- 直接対決を最優先し、同場同距離 → 同場近距離 → 別場同距離の順で最も強い材料を採用します。
-- 同場同距離の直接対決が複数あり、勝ったり負けたりしている場合は互角扱いにします。
-- 物差し馬経由は直接対決がない場合のみ採用し、同条件経由は0.7倍、同場近距離経由は0.5倍、同距離経由は0.35倍に割引します。
-- 隠れ馬経由の優先度2「同競馬場・近い距離違い」では、その中でも今回の競馬場を優先します。
-- 比較が三すくみになった場合は、同場同距離の矢印を最優先し、弱い条件の矢印を外してからランク化します。
-- ばんえいは該当水分量を最優先します。水分違いは小さく参考表示し、通常材料でランク付けできる馬には混ぜません。
         """
     )
 
