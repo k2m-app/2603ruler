@@ -61,7 +61,27 @@ MAX_RELATIVE_DIST_DIFF = 600
 LONG_DISTANCE_MIN = 1700
 BRIDGE_RECENT_DAYS = 180
 BRIDGE_OLD_OK_DIST_MIN = 1800
-_BRIDGE_DISCOUNT_BY_PRIORITY = {5: 1.0, 4: 0.7, 3: 0.5, 2: 0.4, 1: 0.35}
+
+# 南関予想アプリ側の相対比較ロジックを全場版へ移植。
+# 0.5 は「同じ競馬場・同じターン/レイアウトなら、距離窓外でも最後の手段で使う」最弱材料。
+SAME_PLACE_DISTFREE_PRIORITY = 0.5
+_BRIDGE_DISCOUNT_BY_PRIORITY = {
+    5: 1.0,
+    4: 0.7,
+    3: 0.5,
+    2: 0.4,
+    1: 0.35,
+    SAME_PLACE_DISTFREE_PRIORITY: 0.25,
+}
+
+# 直接対決・物差し馬経由の勝敗集約パラメータ。
+_REL_STRONG_EXTRA = 0.6
+_BRIDGE_CONSENSUS_MIN_VOTES = 1
+_BRIDGE_CONSENSUS_AGREE = 0.70
+_BRIDGE_CONSENSUS_INCLUDE_ONE_LOWER = True
+_BRIDGE_CONSENSUS_LOWER_WEIGHT = 0.6
+_REL_CONFIDENCE_GATE = True
+_REL_DOM_EDGE_MIN_BRIDGE_VOTES = 2
 
 LOCAL_PLACES = [
     "帯広", "門別", "盛岡", "水沢", "浦和", "船橋", "大井", "川崎",
@@ -930,13 +950,14 @@ class NarOfficialScraper:
 # 4. 比較グラフ
 # ==========================================
 
+
 def thresholds(is_banei: bool, is_strict: bool, is_water_mismatch_reference: bool = False) -> Tuple[float, float]:
     if is_banei:
         if is_water_mismatch_reference:
             return 15.0, float("inf")
         return 5.0, 15.0
-    return (0.55, 1.05) if is_strict else (0.75, 1.25)
-
+    # 表示用。勝敗判定本体は _rel_direct_draw_th / _bridge_priority_threshold を使用。
+    return (0.3, 0.9) if is_strict else (0.5, 1.1)
 
 def _safe_rank(rank: Any) -> int:
     try:
@@ -1147,8 +1168,14 @@ def _is_long_distance(dist: Any) -> bool:
     return _dist_to_int(dist) >= LONG_DISTANCE_MIN
 
 
+
 def _layout_turn_class(place: str, dist: Any) -> str:
-    """競馬場をまたいでコース形態（コーナー数）を揃えるためのターン分類。"""
+    """競馬場をまたいでコース形態を揃えるための分類。
+
+    南関はターン数を細かく持ち、それ以外の地方場は get_track_layout() の
+    short / mid / long を使う。これにより全地方競馬で「距離が離れすぎた
+    他場比較」を抑えながら、比較不可を減らす。
+    """
     d = _dist_to_int(dist)
     if d <= 0 or not place:
         return ""
@@ -1176,9 +1203,7 @@ def _layout_turn_class(place: str, dist: Any) -> str:
         if d <= 1500:
             return "2turn"
         return "multi_turn"
-    # 南関以外は競馬場ごとの差が大きいため、無理に他場比較へ広げない。
-    return ""
-
+    return get_track_layout(place, d)
 
 def _turn_classes_match(c1: str, c2: str) -> bool:
     """ターン数が同じなら一致とみなす。大井の内外回りは同じ2turn系として扱う。"""
@@ -1194,20 +1219,48 @@ def _is_turn_match_to_current(place: str, dist: Any, current_place: str, current
     return _turn_classes_match(cur_turn, leg_turn)
 
 
-def _race_condition_priority(place: str, dist: Any, current_place: str, current_dist: Any) -> int:
-    """keiba_bot(5).py 準拠の比較レース条件優先度。数字が大きいほど強い材料。"""
+
+def _is_same_place_distfree_ok(place: str, dist: Any, current_place: str, current_dist: Any) -> bool:
+    """最後の手段の直接/bridge比較を許可するか。
+
+    通常の±600m窓を外れても、同じ競馬場で、ターン分類/レイアウトが今回条件と
+    一致している場合だけ最弱材料として採用する。大井は内外回り違いを禁止。
+    """
+    if not place or not current_place or place != current_place:
+        return False
+    d = _dist_to_int(dist)
+    cur_d = _dist_to_int(current_dist)
+    if d <= 0 or cur_d <= 0:
+        return False
+    if not _is_turn_match_to_current(place, d, current_place, cur_d):
+        return False
+    if place == "大井" and _ooi_track_side(d) != _ooi_track_side(cur_d):
+        return False
+    # 南関以外は get_track_layout ベースで同系統なら許容。
+    if place not in ("大井", "船橋", "川崎", "浦和"):
+        return is_same_track_layout(place, d, cur_d)
+    return True
+
+
+
+def _race_condition_priority(place: str, dist: Any, current_place: str, current_dist: Any) -> float:
+    """比較レース条件優先度。数字が大きいほど強い材料。
+
+    5: 同場同距離 / 4: 同場同レイアウト / 3: 同場参考 / 2: 長距離同系統 / 1: 他場同距離系
+    0.5: 同場・同レイアウトだが距離窓外の最後の手段
+    """
     d = _dist_to_int(dist)
     cur_d = _dist_to_int(current_dist)
     if not place or not current_place or d <= 0 or cur_d <= 0:
         return 0
     if not is_relative_distance_allowed(d, cur_d):
+        if _is_same_place_distfree_ok(place, d, current_place, cur_d):
+            return SAME_PLACE_DISTFREE_PRIORITY
         return 0
 
     if _is_long_distance(cur_d):
         if place == current_place and d == cur_d:
             return 5
-        # 長距離は「同じ競馬場の同じコース形態」を最優先。
-        # 例: 船橋1800では、別形態の船橋2200より船橋1600/1500を近い条件として扱う。
         if place == current_place and is_same_track_layout(place, d, cur_d):
             return 4
         same_turn = _is_turn_match_to_current(place, d, current_place, cur_d)
@@ -1226,23 +1279,19 @@ def _race_condition_priority(place: str, dist: Any, current_place: str, current_
             return 5
         if is_same_track_layout(place, d, cur_d):
             return 4
-        return 3
+        if _is_turn_match_to_current(place, d, current_place, cur_d):
+            return 3
+        return 2
     if d == cur_d:
+        return 1
+    # 全場版では他場でも layout が同じ、かつ距離差が小さい場合だけ弱材料にする。
+    if is_same_track_layout(place, d, cur_d) and abs(d - cur_d) <= 300:
         return 1
     return 0
 
 
-def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> int:
-    """
-    直接対決の採用優先度。keiba_bot(5).py の条件判定に寄せる。
-
-    5: 今回と同競馬場・同距離
-    4: 今回と同競馬場・同レイアウト/同系統
-    3: 今回と同競馬場・ターン一致/近い別距離
-    2: 長距離で同場または他場の参考条件
-    1: 別競馬場だが同距離または同ターン参考
-    0: 採用しない
-    """
+def _direct_race_priority(place: str, dist: Any, target_course: str, target_distance: Any) -> float:
+    """直接対決の採用優先度。"""
     d = _dist_to_int(dist)
     cur_dist = _dist_to_int(target_distance)
     if d <= 0 or cur_dist <= 0:
@@ -1251,9 +1300,9 @@ def _direct_race_priority(place: str, dist: Any, target_course: str, target_dist
     # 南関はコーナー数が違う直接対決を混ぜない。
     if target_course in ("大井", "船橋", "川崎", "浦和"):
         if not _is_turn_match_to_current(place, d, target_course, cur_dist):
-            return 0
+            if not _is_same_place_distfree_ok(place, d, target_course, cur_dist):
+                return 0
     return _race_condition_priority(place, d, target_course, cur_dist)
-
 
 def _is_bridge_leg_recent_enough(leg_date: Any, leg_dist: Any, today: Optional[datetime] = None) -> bool:
     """物差し馬経由の各レッグは原則180日以内。1800m以上はレース数が少ないため例外的に許容。"""
@@ -1266,6 +1315,7 @@ def _is_bridge_leg_recent_enough(leg_date: Any, leg_dist: Any, today: Optional[d
     return (base - dt).days <= BRIDGE_RECENT_DAYS
 
 
+
 def _hidden_bridge_priority(
     place1: str,
     dist1: Any,
@@ -1273,16 +1323,8 @@ def _hidden_bridge_priority(
     dist2: Any,
     current_dist: Any = None,
     current_place: str = None,
-) -> int:
-    """keiba_bot(5).py 準拠の物差し馬経由優先度。
-
-    5: 両レッグが今回と同場・同距離
-    4: 両レッグが今回と同場・同レイアウト、または長距離同場同系統
-    3: 同場内の有力な距離違い/片レッグ同距離
-    2: 同場だがレイアウト違いを含む、または長距離他場同系統
-    1: 他場同系統の最終参考
-    0: 採用しない
-    """
+) -> float:
+    """物差し馬経由の条件優先度。南関予想アプリ側の制御を全場版へ移植。"""
     d1 = _dist_to_int(dist1)
     d2 = _dist_to_int(dist2)
     cur_d = _dist_to_int(current_dist)
@@ -1291,9 +1333,12 @@ def _hidden_bridge_priority(
 
     if current_place and cur_d > 0:
         if not (is_relative_distance_allowed(d1, cur_d) and is_relative_distance_allowed(d2, cur_d)):
+            if (_is_same_place_distfree_ok(place1, d1, current_place, cur_d)
+                    and _is_same_place_distfree_ok(place2, d2, current_place, cur_d)):
+                return SAME_PLACE_DISTFREE_PRIORITY
             return 0
 
-        # 南関は各レッグのターン分類が今回と一致しないものを採用しない。
+        # 各レッグのコース形態が今回と大きく違うものは採用しない。
         if current_place in ("大井", "船橋", "川崎", "浦和"):
             if not _is_turn_match_to_current(place1, d1, current_place, cur_d):
                 return 0
@@ -1317,7 +1362,7 @@ def _hidden_bridge_priority(
                     return 4 if (d1 == cur_d or d2 == cur_d) else 3
                 return 0
 
-            # 長距離の他場比較は、距離違いをむやみに混ぜない。
+            # 長距離の他場比較は距離違いをむやみに混ぜない。
             if place1 == place2 and d1 != d2:
                 return 0
             if place1 != current_place and place2 != current_place:
@@ -1352,7 +1397,17 @@ def _hidden_bridge_priority(
                         return 0
                 if abs(d1 - cur_d) < 400 and abs(d2 - cur_d) < 400:
                     return 1
-        return 0
+
+        # 弱bridge: 場が混成でも、両レッグが今回距離に近く、全場のlayout分類が矛盾しなければ弱比較にする。
+        # 大井の内外回りまたぎは禁止を維持。
+        if current_place == "大井":
+            if place1 == "大井" and _ooi_track_side(d1) != _ooi_track_side(cur_d):
+                return 0
+            if place2 == "大井" and _ooi_track_side(d2) != _ooi_track_side(cur_d):
+                return 0
+        if place1 == "大井" and place2 == "大井" and _ooi_track_side(d1) != _ooi_track_side(d2):
+            return 0
+        return 1
 
     # 今回条件が渡らない場合の保守フォールバック。
     if place1 == place2:
@@ -1364,7 +1419,6 @@ def _hidden_bridge_priority(
             return 2
     return 0
 
-
 def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place2: str, target_course: str) -> int:
     """同じ優先度の物差し馬経由では、今回の競馬場を通る材料を優先する。"""
     if bridge_priority in (2, 3, 4) and place1 == place2 == target_course:
@@ -1372,48 +1426,214 @@ def _hidden_bridge_current_course_bonus(bridge_priority: int, place1: str, place
     return 0
 
 
+
 def _entry_rank_priority(entry: Dict[str, Any]) -> int:
-    """
-    順位化・三すくみ整理用の信頼度。小さいほど強い条件。
-
-    0: 直接対決・同競馬場同距離
-    2: 直接対決・同競馬場近距離
-    3: 直接対決・別競馬場同距離
-    4: 物差し馬経由・同場同距相当
-    5: 物差し馬経由・同場近距離相当
-    6: 物差し馬経由・別場同距離相当
-    9: 水分違い等の参考材料
-    """
+    """順位化・三すくみ整理用の信頼度。小さいほど強い条件。"""
     if entry.get("water_mismatch_reference"):
-        return 9
+        return 12
 
-    direct_priority = int(entry.get("direct_priority") or 0)
-    if direct_priority == 5:
+    direct_priority = float(entry.get("direct_priority") or 0)
+    if direct_priority >= 5:
         return 0
-    if direct_priority == 4:
+    if direct_priority >= 4:
         return 1
-    if direct_priority == 3:
+    if direct_priority >= 3:
         return 2
-    if direct_priority == 2:
+    if direct_priority >= 2:
         return 3
-    if direct_priority == 1:
+    if direct_priority >= 1:
         return 4
+    if direct_priority == SAME_PLACE_DISTFREE_PRIORITY:
+        return 10
 
-    bridge_priority = int(entry.get("bridge_priority") or 0)
-    if bridge_priority == 5:
+    bridge_priority = float(entry.get("bridge_priority") or 0)
+    if bridge_priority >= 5:
         return 5
-    if bridge_priority == 4:
+    if bridge_priority >= 4:
         return 6
-    if bridge_priority == 3:
+    if bridge_priority >= 3:
         return 7
-    if bridge_priority == 2:
+    if bridge_priority >= 2:
         return 8
-    if bridge_priority == 1:
+    if bridge_priority >= 1:
         return 9
+    if bridge_priority == SAME_PLACE_DISTFREE_PRIORITY:
+        return 11
 
     if entry.get("is_strict"):
-        return 1
-    return 8
+        return 2
+    return 10
+
+
+def _rel_direct_draw_th(cur_dist: Any) -> float:
+    """直接対決の優劣判定基準。マイル以下=0.3秒、マイル超=0.5秒。"""
+    return 0.3 if _dist_to_int(cur_dist) <= 1600 else 0.5
+
+
+def _bridge_priority_threshold(priority: float) -> float:
+    """物差し馬経由の優劣判定基準。低priorityほど大差でないと矢印を出さない。"""
+    return round(0.5 + 0.1 * max(0.0, 5 - float(priority or 0)), 2)
+
+
+def _relative_entry_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return parse_date_any(value)
+    return datetime.min
+
+
+def _relative_recency_weight(value: Any, now: Optional[datetime] = None) -> float:
+    dt = _relative_entry_datetime(value)
+    if dt == datetime.min:
+        return 0.70
+    now = now or datetime.now()
+    days = max(0, (now - dt).days)
+    return max(0.60, 1.0 - min(days, 730) / 1825.0)
+
+
+def _relative_source_quality(entry: Dict[str, Any], current_course: str = "", current_dist: Any = 0) -> Tuple[float, int]:
+    if not isinstance(entry, dict):
+        return (-1.0, -1)
+    if "direct_priority" in entry:
+        quality = float(entry.get("direct_priority", 0) or 0)
+        if entry.get("place") == current_course and _dist_to_int(entry.get("dist", "")) == _dist_to_int(current_dist):
+            quality = 5.0
+        return (quality, 2)
+    if "bridge_priority" in entry:
+        return (float(entry.get("bridge_priority", 0) or 0), 1)
+    return (-1.0, 0)
+
+
+def _relative_condition_weight(entry: Dict[str, Any], current_course: str = "", current_dist: Any = 0, now: Optional[datetime] = None) -> float:
+    quality = max(0.0, _relative_source_quality(entry, current_course, current_dist)[0])
+    condition_weight = 0.55 + 0.45 * min(quality, 5.0) / 5.0
+    factor = float(entry.get("consensus_weight_factor", 1.0) or 1.0)
+    return condition_weight * _relative_recency_weight(entry.get("date"), now=now) * factor
+
+
+def _drop_stale_direct_reversal(entries: List[Dict[str, Any]], draw_th: float, cur_dist: Any) -> List[Dict[str, Any]]:
+    """直近で力関係が改善した時、古い大敗を1件だけ落とす。"""
+    entries = list(entries or [])
+    if len(entries) < 3:
+        return entries
+    ordered = sorted(entries, key=lambda e: _relative_entry_datetime(e.get("date")))
+    newest = ordered[-1]
+    newest_diff = float(newest.get("diff", 0) or 0)
+    improve_th = 0.35 if _dist_to_int(cur_dist) <= 1600 else 0.5
+    drop_id = None
+
+    if newest_diff >= -draw_th:
+        for old in ordered[:-1]:
+            old_diff = float(old.get("diff", 0) or 0)
+            if old_diff <= -draw_th and (newest_diff - old_diff) >= improve_th:
+                drop_id = id(old)
+                break
+    if drop_id is None and newest_diff <= draw_th:
+        for old in ordered[:-1]:
+            old_diff = float(old.get("diff", 0) or 0)
+            if old_diff >= draw_th and (old_diff - newest_diff) >= improve_th:
+                drop_id = id(old)
+                break
+    if drop_id is None:
+        return entries
+    kept = [e for e in entries if id(e) != drop_id]
+    return kept or entries
+
+
+def _aggregate_direct_entries(
+    entries: List[Dict[str, Any]],
+    cur_dist: Any,
+    current_course: str = "",
+    now: Optional[datetime] = None,
+) -> Tuple[str, List[Dict[str, Any]], float, int, int]:
+    """最良条件の直接対決を新しさ・条件品質で加重集約する。"""
+    entries = list(entries or [])
+    if not entries:
+        return "=", [], 0.0, 0, 0
+    draw_th = _rel_direct_draw_th(cur_dist)
+    strong_th = draw_th + _REL_STRONG_EXTRA
+    selected = _drop_stale_direct_reversal(entries, draw_th, cur_dist)
+    selected = sorted(
+        selected,
+        key=lambda e: (
+            -_relative_condition_weight(e, current_course, cur_dist, now=now),
+            -_relative_entry_datetime(e.get("date")).timestamp()
+            if _relative_entry_datetime(e.get("date")) != datetime.min else 0,
+        ),
+    )[:5]
+
+    weighted_total = weighted_diff = 0.0
+    pos_weight = neg_weight = 0.0
+    wins = losses = 0
+    for entry in selected:
+        weight = _relative_condition_weight(entry, current_course, cur_dist, now=now)
+        diff = float(entry.get("diff", 0) or 0)
+        weighted_total += weight
+        weighted_diff += diff * weight
+        if diff >= draw_th:
+            wins += 1
+            pos_weight += weight
+        elif diff <= -draw_th:
+            losses += 1
+            neg_weight += weight
+
+    avg_diff = weighted_diff / weighted_total if weighted_total else float(selected[0].get("diff", 0) or 0)
+    if pos_weight > neg_weight and avg_diff >= draw_th * 0.65:
+        strong = avg_diff >= strong_th or (wins >= 2 and losses == 0)
+        symbol = ">>" if strong else ">"
+    elif neg_weight > pos_weight and avg_diff <= -draw_th * 0.65:
+        strong = avg_diff <= -strong_th or (losses >= 2 and wins == 0)
+        symbol = "<<" if strong else "<"
+    else:
+        symbol = "="
+    return symbol, selected, avg_diff, wins, losses
+
+
+def _bridge_consensus_symbol(entries: List[Dict[str, Any]], cur_dist: Any) -> Tuple[str, int, int]:
+    """隠れ馬経由は1頭=1票で合議。単発bridgeの過信を防ぐ。"""
+    if not entries:
+        return "=", 0, 0
+    best_priority = max(float(e.get("bridge_priority", 0) or 0) for e in entries)
+    if best_priority <= 0:
+        return "=", 0, 0
+
+    usable = []
+    for e in entries:
+        priority = float(e.get("bridge_priority", 0) or 0)
+        if priority == best_priority or (
+            _BRIDGE_CONSENSUS_INCLUDE_ONE_LOWER
+            and priority >= max(1, best_priority - 1)
+        ):
+            usable.append(e)
+    if not usable:
+        return "=", 0, 0
+
+    pos_w = neg_w = 0.0
+    pos_votes = neg_votes = 0
+    for e in usable:
+        priority = float(e.get("bridge_priority", 0) or 0)
+        raw_diff = float(e.get("raw_diff", e.get("diff", 0)) or 0)
+        threshold = _bridge_priority_threshold(priority)
+        weight = float(e.get("consensus_weight_factor", 1.0) or 1.0)
+        # ばんえいは秒差スケールが大きいため、既存 thresholds の水準を利用する。
+        if _dist_to_int(cur_dist) == 200:
+            threshold = max(threshold, 5.0)
+        if raw_diff >= threshold:
+            pos_votes += 1
+            pos_w += weight
+        elif raw_diff <= -threshold:
+            neg_votes += 1
+            neg_w += weight
+
+    total_w = pos_w + neg_w
+    if (pos_votes + neg_votes) < _BRIDGE_CONSENSUS_MIN_VOTES or total_w <= 0:
+        return "=", pos_votes, neg_votes
+    if pos_w / total_w >= _BRIDGE_CONSENSUS_AGREE:
+        return ">>", pos_votes, neg_votes
+    if neg_w / total_w >= _BRIDGE_CONSENSUS_AGREE:
+        return "<<", pos_votes, neg_votes
+    return "=", pos_votes, neg_votes
 
 
 
@@ -1425,7 +1645,6 @@ def compute_pairwise_results(
     is_banei: bool,
 ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     current_names = set(runners)
-    cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
     pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]] = {u: {v: [] for v in runners} for u in runners}
     hidden_nodes = [n for n in G.nodes() if n not in current_names]
 
@@ -1446,7 +1665,8 @@ def compute_pairwise_results(
                     rank = min(_safe_rank(hi.get("self_rank")), _safe_rank(hi.get("opp_rank")))
                     priority_entries.append({
                         "diff": hi["diff"],
-                        "is_strict": priority == 5,
+                        "raw_diff": hi["diff"],
+                        "is_strict": priority >= 4,
                         "place": place,
                         "dist": dist,
                         "water": hi.get("water"),
@@ -1469,16 +1689,14 @@ def compute_pairwise_results(
                 if priority_entries:
                     water_matched_entries = [e for e in priority_entries if not e.get("water_mismatch_reference")]
                     target_pool = water_matched_entries or priority_entries
-                    best_priority = max(e["direct_priority"] for e in target_pool)
-                    target_direct = [e for e in target_pool if e["direct_priority"] == best_priority]
+                    best_priority = max(float(e["direct_priority"]) for e in target_pool)
+                    target_direct = [e for e in target_pool if float(e["direct_priority"]) == best_priority]
                     target_direct.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
 
-                    # 同競馬場・同距離の直接対決は、勝ったり負けたりを検出するため複数件残す。
-                    # それ以外の近距離・別場同距離は、同条件が無い時だけ代表1件を使う。
-                    if best_priority == 5:
-                        pair_net[u][v].extend(target_direct[:5])
-                    else:
-                        pair_net[u][v].append(target_direct[0])
+                    # 同条件は最大5件、近い条件でも最大3件を残し、後段で加重集約する。
+                    # 代表1件だけにすると「勝ったり負けたり」「直近改善」を拾えないため。
+                    limit = 5 if best_priority >= 5 else 3
+                    pair_net[u][v].extend(target_direct[:limit])
                 if pair_net[u][v]:
                     continue
 
@@ -1489,7 +1707,7 @@ def compute_pairwise_results(
                 if not u_h or not h_v:
                     continue
 
-                bridge_diffs: List[Tuple[int, int, float, str, Any, datetime, bool, int, Dict[str, Any], Dict[str, Any], bool]] = []
+                bridge_diffs: List[Tuple[float, int, float, str, Any, datetime, bool, int, Dict[str, Any], Dict[str, Any], bool]] = []
                 for uh in u_h:
                     for hv in h_v:
                         p1, d1 = uh.get("place", ""), uh.get("dist", "")
@@ -1506,10 +1724,10 @@ def compute_pairwise_results(
                         if not _is_bridge_leg_recent_enough(hv.get("date"), d2):
                             continue
 
-                        course_bonus = _hidden_bridge_current_course_bonus(bridge_priority, p1, p2, target_course)
-                        est = uh["diff"] + hv["diff"]
+                        course_bonus = _hidden_bridge_current_course_bonus(int(bridge_priority), p1, p2, target_course)
+                        est = float(uh["diff"] or 0) + float(hv["diff"] or 0)
                         dt = min(_entry_sort_date(uh), _entry_sort_date(hv))
-                        is_current_same = bridge_priority == 5
+                        is_current_same = bridge_priority >= 5
                         bridge_rank = min(_safe_rank(uh.get("self_rank")), _safe_rank(hv.get("opp_rank")))
                         water_mismatch_reference = bool(
                             uh.get("water_mismatch_reference") or hv.get("water_mismatch_reference")
@@ -1521,18 +1739,20 @@ def compute_pairwise_results(
 
                 water_matched_diffs = [x for x in bridge_diffs if not x[10]]
                 target_pool = water_matched_diffs or bridge_diffs
-                best_priority = max(x[0] for x in target_pool)
-                target_diffs = [x for x in target_pool if x[0] == best_priority]
+                best_priority = max(float(x[0]) for x in target_pool)
+                target_diffs = [x for x in target_pool if float(x[0]) == best_priority]
                 if best_priority == 2:
                     best_course_bonus = max(x[1] for x in target_diffs)
                     target_diffs = [x for x in target_diffs if x[1] == best_course_bonus]
 
                 target_diffs.sort(key=lambda x: _rank_sort_key(x[7], x[5]))
+                # 隠れ馬1頭につき最良レッグ1件を投票にする。
                 best = target_diffs[0]
                 discount = _BRIDGE_DISCOUNT_BY_PRIORITY.get(best_priority, 0.35)
                 candidates.append({
                     "diff": best[2] * discount,
-                    "is_strict": best[6],
+                    "raw_diff": best[2],
+                    "is_strict": best[6] or best_priority >= 4,
                     "place": best[3],
                     "dist": best[4],
                     "water": best[8].get("water"),
@@ -1553,24 +1773,33 @@ def compute_pairwise_results(
                 })
 
             if candidates:
-                candidates.sort(
+                water_matched_candidates = [c for c in candidates if not c.get("water_mismatch_reference")]
+                target_pool = water_matched_candidates or candidates
+                best_priority = max(float(c.get("bridge_priority", 0) or 0) for c in target_pool)
+                accepted_priorities = {best_priority}
+                if _BRIDGE_CONSENSUS_INCLUDE_ONE_LOWER and best_priority >= 2:
+                    accepted_priorities.add(best_priority - 1)
+                selected = [c for c in target_pool if float(c.get("bridge_priority", 0) or 0) in accepted_priorities]
+                for c in selected:
+                    if float(c.get("bridge_priority", 0) or 0) < best_priority:
+                        c["consensus_weight_factor"] = _BRIDGE_CONSENSUS_LOWER_WEIGHT
+                selected.sort(
                     key=lambda x: (
-                        int(not x.get("water_mismatch_reference")),
-                        int(x.get("bridge_priority", 0)),
+                        float(x.get("bridge_priority", 0) or 0),
                         int(x.get("bridge_current_course_bonus", 0)),
                         -_safe_rank(x.get("rank")),
                         _entry_sort_date(x),
-                        abs(x.get("diff", 0.0)),
+                        abs(float(x.get("raw_diff", x.get("diff", 0)) or 0)),
                     ),
                     reverse=True,
                 )
-                pair_net[u][v].append(candidates[0])
+                pair_net[u][v].extend(selected[:8])
 
     return pair_net
 
-
 def inverse_sym(s: str) -> str:
     return {">>": "<<", ">": "<", "=": "=", "<": ">", "<<": ">>"}.get(s, "=")
+
 
 
 def compute_matchup_matrix(
@@ -1581,124 +1810,80 @@ def compute_matchup_matrix(
     is_banei: bool,
 ) -> Dict[str, Dict[str, str]]:
     matchup_matrix: Dict[str, Dict[str, str]] = {u: {} for u in runners}
+    cur_dist = _dist_to_int(target_distance)
     now = datetime.now()
 
     for i, u in enumerate(runners):
         for j, v in enumerate(runners):
             if i >= j:
                 continue
-            entries = pair_net.get(u, {}).get(v, [])
+            entries = list(pair_net.get(u, {}).get(v, []) or [])
             if not entries:
                 continue
-
-            best_bridge_priority = max((int(e.get("bridge_priority") or 0) for e in entries), default=0)
-            if best_bridge_priority:
-                entries = [e for e in entries if int(e.get("bridge_priority") or 0) == best_bridge_priority]
 
             water_matched_entries = [e for e in entries if not e.get("water_mismatch_reference")]
             if water_matched_entries:
                 entries = water_matched_entries
 
-            best_is_strict = any(e.get("is_strict") for e in entries)
-            target_entries = [e for e in entries if bool(e.get("is_strict")) == best_is_strict]
-            target_entries.sort(key=lambda e: _rank_sort_key(e.get("rank"), e.get("date")))
-            if best_bridge_priority:
-                target_entries = target_entries[:1]
-            elif best_is_strict:
-                # 同競馬場・同距離の直接対決は複数件を使い、勝敗が割れたら互角にする。
-                target_entries = target_entries[:5]
-            else:
-                target_entries = target_entries[:3]
-            is_water_mismatch_reference = any(e.get("water_mismatch_reference") for e in target_entries)
-            draw_th, strong_th = thresholds(is_banei, best_is_strict, is_water_mismatch_reference)
+            direct_entries = [e for e in entries if e.get("route") == "direct" or "direct_priority" in e]
+            bridge_entries = [e for e in entries if "bridge_priority" in e]
 
-            is_forgiven_u = False
-            is_forgiven_v = False
-            cur_dist = int(target_distance) if str(target_distance).isdigit() else 0
-            if target_course == "大井" and is_ooi_outer(cur_dist):
-                for e in target_entries:
-                    if e.get("place") == "大井" and is_ooi_inner(e.get("dist")):
-                        if e.get("diff", 0.0) < 0:
-                            is_forgiven_u = True
-                        if -e.get("diff", 0.0) < 0:
-                            is_forgiven_v = True
+            if direct_entries:
+                best_quality = max(float(e.get("direct_priority", 0) or 0) for e in direct_entries)
+                target_entries = [e for e in direct_entries if float(e.get("direct_priority", 0) or 0) == best_quality]
+                final_sym_u, target_entries, weighted_diff, wins, losses = _aggregate_direct_entries(
+                    target_entries,
+                    cur_dist,
+                    current_course=target_course,
+                    now=now,
+                )
 
-            if best_is_strict and len(target_entries) >= 2:
-                has_win = any(e["diff"] >= draw_th for e in target_entries)
-                has_loss = any(e["diff"] <= -draw_th for e in target_entries)
-                if has_win and has_loss:
-                    matchup_matrix[u][v] = matchup_matrix[v][u] = "="
-                    rank_priority = min(_entry_rank_priority(e) for e in target_entries)
+                # 大井外回りで内回り負けを強く取りすぎない救済。
+                is_forgiven_u = False
+                is_forgiven_v = False
+                if target_course == "大井" and is_ooi_outer(cur_dist):
                     for e in target_entries:
-                        e["matchup_rank_priority"] = rank_priority
-                    continue
+                        if e.get("place") == "大井" and is_ooi_inner(e.get("dist")):
+                            if float(e.get("diff", 0.0) or 0.0) < 0:
+                                is_forgiven_u = True
+                            if -float(e.get("diff", 0.0) or 0.0) < 0:
+                                is_forgiven_v = True
+                if is_forgiven_u and final_sym_u in ("<", "<<"):
+                    final_sym_u = "="
+                if is_forgiven_v and final_sym_u in (">", ">>"):
+                    final_sym_u = "="
 
-            def get_sym(entries_for_calc: List[Dict[str, Any]], sign: float = 1.0) -> str:
-                if not entries_for_calc:
-                    return "="
-                weighted_sum = 0.0
-                total_weight = 0.0
-                wins = losses = 0
-                for k, e in enumerate(entries_for_calc):
-                    base_w = 1.0 if k == 0 else 0.9 if k == 1 else 0.7
-                    dt = _entry_sort_date(e)
-                    days = (now - dt).days if dt != datetime.min else 180
-                    months = max(0.0, days / 30.0)
-                    if best_is_strict:
-                        time_w = 1.0 if months <= 3 else 0.6 if months <= 6 else 0.3
-                    else:
-                        time_w = 1.0 if months <= 2 else 0.8 if months <= 3 else 0.6 if months <= 6 else 0.3
-                    w = base_w * time_w
-                    d = e["diff"] * sign
-                    if d >= draw_th:
-                        wins += 1
-                    elif d <= -draw_th:
-                        losses += 1
-                    weighted_sum += d * w
-                    total_weight += w
+                rank_priority = min(_entry_rank_priority(e) for e in target_entries) if target_entries else 99
+                for e in target_entries:
+                    e["matchup_rank_priority"] = rank_priority
+                    e["matchup_source"] = "direct"
+                    e["matchup_evidence_count"] = len(target_entries)
+                matchup_matrix[u][v] = final_sym_u
+                matchup_matrix[v][u] = inverse_sym(final_sym_u)
+                continue
 
-                avg = weighted_sum / total_weight if total_weight else 0.0
-                if wins == len(entries_for_calc) and wins > 0:
-                    return ">>" if avg >= strong_th else ">"
-                if losses == len(entries_for_calc) and losses > 0:
-                    return "<<" if avg <= -strong_th else "<"
-                if avg >= draw_th:
-                    return ">>" if avg >= strong_th else ">"
-                if avg <= -draw_th:
-                    return "<<" if avg <= -strong_th else "<"
-                return "="
-
-            sym_all_u = get_sym(target_entries, sign=1.0)
-            sorted_for_u = sorted(target_entries, key=lambda e: e["diff"], reverse=True)
-            sym_best2_u = get_sym(sorted_for_u[:2], sign=1.0)
-            sorted_for_v = sorted(target_entries, key=lambda e: e["diff"])
-            sym_best2_v = get_sym(sorted_for_v[:2], sign=-1.0)
-
-            rescue_u = sym_all_u in ("<", "<<") and sym_best2_u in (">", ">>")
-            sym_all_v = inverse_sym(sym_all_u)
-            rescue_v = sym_all_v in ("<", "<<") and sym_best2_v in (">", ">>")
-
-            if rescue_u:
-                sym = sym_best2_u
-            elif rescue_v:
-                sym = inverse_sym(sym_best2_v)
-            else:
-                sym = sym_all_u
-
-            if is_forgiven_u and sym in ("<", "<<"):
-                sym = "="
-            if is_forgiven_v and sym in (">", ">>"):
-                sym = "="
-
-            rank_priority = min(_entry_rank_priority(e) for e in target_entries)
-            for e in target_entries:
-                e["matchup_rank_priority"] = rank_priority
-
-            matchup_matrix[u][v] = sym
-            matchup_matrix[v][u] = inverse_sym(sym)
+            if bridge_entries:
+                best_bridge_priority = max(float(e.get("bridge_priority", 0) or 0) for e in bridge_entries)
+                target_entries = [
+                    e for e in bridge_entries
+                    if float(e.get("bridge_priority", 0) or 0) == best_bridge_priority
+                    or (
+                        _BRIDGE_CONSENSUS_INCLUDE_ONE_LOWER
+                        and float(e.get("bridge_priority", 0) or 0) >= max(1, best_bridge_priority - 1)
+                    )
+                ]
+                final_sym_u, cons_pos, cons_neg = _bridge_consensus_symbol(target_entries, cur_dist)
+                rank_priority = min(_entry_rank_priority(e) for e in target_entries) if target_entries else 99
+                ev_count = cons_pos + cons_neg
+                for e in target_entries:
+                    e["matchup_rank_priority"] = rank_priority
+                    e["matchup_source"] = "bridge"
+                    e["matchup_evidence_count"] = ev_count
+                matchup_matrix[u][v] = final_sym_u
+                matchup_matrix[v][u] = inverse_sym(final_sym_u)
+                continue
 
     return matchup_matrix
-
 
 def evaluate_and_rank(
     pair_net: Dict[str, Dict[str, List[Dict[str, Any]]]],
@@ -1753,6 +1938,12 @@ def evaluate_and_rank(
                 continue
             if u not in pool or v not in pool:
                 continue
+            # 隠れ馬1頭だけの薄いbridge勝敗は、表示上の比較材料には残すが
+            # ランク骨格(S/A/B/Cの上下関係)には使わない。
+            source_values = {e.get("matchup_source") for e in entries if isinstance(e, dict)}
+            ev_count = max((int(e.get("matchup_evidence_count", 0) or 0) for e in entries if isinstance(e, dict)), default=0)
+            if _REL_CONFIDENCE_GATE and source_values == {"bridge"} and ev_count < _REL_DOM_EDGE_MIN_BRIDGE_VOTES:
+                continue
             winner, loser = (u, v) if rel in (">", ">>") else (v, u)
             D.add_edge(winner, loser, rank_priority=matchup_priority(u, v))
 
@@ -1803,7 +1994,12 @@ def evaluate_and_rank(
         if u in unranked:
             continue
         comp = comp_index[u]
-        tier = tier_by_level.get(level_by_comp.get(comp, 0), "C")
+        # dominance edge が1本も無い/その馬に入出力が無い場合、全馬S化を防ぐため中位Bに置く。
+        # これは「比較材料はあるが、明確な上下までは言えない」ケース。
+        if D.number_of_edges() == 0 or D.degree(u) == 0:
+            tier = "B"
+        else:
+            tier = tier_by_level.get(level_by_comp.get(comp, 0), "C")
         tier_map[u] = tier
         direct_down = 0
         strong_down = 0
